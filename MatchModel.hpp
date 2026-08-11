@@ -137,6 +137,13 @@ public:
     Prefetch(&hash_table_[(hash_ ^ ctx) & hash_mask_]);
   }
 
+  // The next update() xors the byte just emitted into the hash before probing
+  // the table, so once that byte is known the slot it will touch is fixed;
+  // prefetching it here hides most of the table-read latency of the next byte.
+  ALWAYS_INLINE void PrefetchNextUpdate(uint32_t next_char) {
+    Prefetch(&hash_table_[(hash_ ^ next_char) & hash_mask_]);
+  }
+
   NO_INLINE void update(Buffer& buffer) {
     const auto blast = buffer.Pos() - 1;
     const auto bmask = buffer.Mask();

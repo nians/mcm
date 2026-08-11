@@ -1143,6 +1143,9 @@ namespace cm {
       if (AnyModelEnabled(kModelSpecialChar)) {
         special_char_model_.Update(c);
       }
+      if (kUsePrefetch && cur_profile_.MatchModelOrder() != 0) {
+        match_model_.PrefetchNextUpdate(c);
+      }
     }
 
     virtual void compress(Stream* in_stream, Stream* out_stream, uint64_t max_count);
