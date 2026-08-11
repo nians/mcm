@@ -816,15 +816,6 @@ namespace cm {
       }
     }
 
-    // Optimal leaf algorithm.
-    uint64_t SolveOptimalLeaves(const uint64_t* cost) {
-      // DP array [node][remain] = max leaf values
-      static const size_t kCount = 1 << 16;
-      int64_t total[kCount];
-      std::fill_n(total, kCount, -1);
-      return DPOptimalLeaves(cost, total, 0, 64);
-    }
-
     int NextNibbleLeaf(int node, size_t next) {
       // 0
       // 1(1) 2(10)
@@ -941,6 +932,7 @@ namespace cm {
             uint32_t ch = c << 24;
             bool second_nibble = false;
             size_t base_ctx = 0;
+            size_t high_nibble = 0;
             for (;;) {
               auto* st0 = s0 + ctx;
               auto* st1 = s1 + ctx;
@@ -975,7 +967,8 @@ namespace cm {
                 if (second_nibble) {
                   break;
                 }
-                base_ctx = 15 + (ctx ^ 0x10) * 15;
+                high_nibble = ctx ^ 0x10;
+                base_ctx = 15 + high_nibble * 15;
                 s0 += base_ctx;
                 s1 += base_ctx;
                 s2 += base_ctx;
@@ -984,7 +977,10 @@ namespace cm {
               }
             }
             if (decode) {
-              c = ctx & 0xFF;
+              // ctx only holds the second (low) nibble here; the first nibble
+              // was folded into base_ctx, so it must be restored explicitly or
+              // the decoder emits the wrong byte and desynchronizes.
+              c = (high_nibble << 4) | (ctx ^ 0x10);
             }
           }
           return c;
@@ -1114,11 +1110,20 @@ namespace cm {
       UpdateLearnRates();
     }
 
+    ALWAYS_INLINE bool AnyModelEnabled(ModelType model) const {
+      return cur_profile_.ModelEnabled(model) || cur_match_profile_.ModelEnabled(model);
+    }
+
     void update(uint32_t c) {
-      if (cur_profile_.ModelEnabled(kModelWord1) ||
-        cur_profile_.ModelEnabled(kModelWord2) ||
-        cur_profile_.ModelEnabled(kModelWord12) ||
-        true) {
+      // Only maintain the models something can actually read; the states reset
+      // in SetDataProfile whenever the profile switches, so skipping updates
+      // while they are unused cannot leak stale state. The text-profile mixer
+      // context reads word_model_.getLength() even with no word model enabled
+      // (CalcMixerBase), so the text interval map keeps the word model live.
+      if (current_interval_map_ != binary_interval_map_ ||
+        AnyModelEnabled(kModelWord1) ||
+        AnyModelEnabled(kModelWord2) ||
+        AnyModelEnabled(kModelWord12)) {
         word_model_.update(c);
         if (kPrefetchWordModel && word_model_.getLength() > 2) {
           HashLookup(word_model_.getHash(), true);
@@ -1132,8 +1137,12 @@ namespace cm {
       interval_model2_ = (interval_model2_ << 4) | current_interval_map2_[c];
       small_interval_model_ = (small_interval_model_ * 8) + current_small_interval_map_[c];
       last_bytes_ = (last_bytes_ << 8) | static_cast<uint8_t>(c);
-      bracket_.Update(c);
-      special_char_model_.Update(c);
+      if (AnyModelEnabled(kModelBracket)) {
+        bracket_.Update(c);
+      }
+      if (AnyModelEnabled(kModelSpecialChar)) {
+        special_char_model_.Update(c);
+      }
     }
 
     virtual void compress(Stream* in_stream, Stream* out_stream, uint64_t max_count);

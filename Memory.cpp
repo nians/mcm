@@ -27,12 +27,15 @@
 #include "Memory.hpp"
 #include "Util.hpp"
 
-#define USE_MALLOC 1
-
 #ifdef WIN32
 #include <Windows.h>
+#define USE_MALLOC 0
+#elif defined(__linux__) || defined(__APPLE__)
+#include <sys/mman.h>
+#define USE_MMAP 1
+#define USE_MALLOC 0
 #else
-// TODO: mmap
+#define USE_MALLOC 1
 #endif
 
 MemMap::MemMap() : storage(nullptr), size(0) {
@@ -45,13 +48,28 @@ MemMap::~MemMap() {
 
 void MemMap::resize(size_t bytes) {
   if (bytes == size) {
-    std::fill(reinterpret_cast<uint8_t*>(storage), reinterpret_cast<uint8_t*>(storage) + size, 0);
+    zero();
     return;
   }
   release();
   size = bytes;
 #if USE_MALLOC
   storage = std::calloc(1, bytes);
+#elif defined(USE_MMAP)
+  // Anonymous private mappings are zero-filled. The model tables are huge and
+  // hit with random accesses, so ask for transparent huge pages to cut dTLB
+  // misses (a measured decompression bottleneck); the hint is a no-op where
+  // THP is unavailable.
+  storage = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (storage == MAP_FAILED) {
+    storage = std::calloc(1, bytes);
+  } else {
+#ifdef MADV_HUGEPAGE
+    madvise(storage, size, MADV_HUGEPAGE);
+#endif
+    mapped_ = true;
+  }
 #elif WIN32
   storage = (void*)VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
@@ -63,6 +81,13 @@ void MemMap::release() {
   if (storage != nullptr) {
 #if USE_MALLOC
     std::free(storage);
+#elif defined(USE_MMAP)
+    if (mapped_) {
+      munmap(storage, size);
+      mapped_ = false;
+    } else {
+      std::free(storage);
+    }
 #elif WIN32
     BOOL result = VirtualFree((LPVOID)storage, size, MEM_DECOMMIT);
 #else
@@ -70,11 +95,22 @@ void MemMap::release() {
 #endif
     storage = nullptr;
   }
+  size = 0;
 }
 
 void MemMap::zero() {
-#ifdef USE_MALLOC
+#if USE_MALLOC
   std::memset(storage, 0, size);
+#elif defined(USE_MMAP)
+  if (mapped_) {
+    // Drop the pages; anonymous mappings refill with zeros on next touch.
+    madvise(storage, size, MADV_DONTNEED);
+#ifdef MADV_HUGEPAGE
+    madvise(storage, size, MADV_HUGEPAGE);
+#endif
+  } else {
+    std::memset(storage, 0, size);
+  }
 #elif WIN32
   storage = (void*)VirtualAlloc(storage, size, MEM_RESET, PAGE_READWRITE);
 #else

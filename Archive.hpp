@@ -117,6 +117,11 @@ public:
     Detector::Profile profile() const {
       return profile_;
     }
+    // For the speed-oriented levels, cap the memory level so the model tables
+    // stay proportionate to the block: oversized tables barely help ratio but
+    // cost a lot of decompression speed in cache/TLB misses. Must run before
+    // the algorithm is serialized so decompression sees the same level.
+    void CapMemUsage(uint64_t block_size);
 
   private:
     uint8_t mem_usage_;

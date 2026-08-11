@@ -151,6 +151,22 @@ Compressor* Archive::Algorithm::CreateCompressor(const FrequencyCounter<256>& fr
   return nullptr;
 }
 
+void Archive::Algorithm::CapMemUsage(uint64_t block_size) {
+  // Only the speed-oriented levels trade table size for speed here; the
+  // ratio-oriented levels keep whatever the user requested.
+  if (algorithm_ != Compressor::kTypeCMTurbo && algorithm_ != Compressor::kTypeCMFast) {
+    return;
+  }
+  // Smallest level whose hash table (2MB << level, CM.hpp) still holds ~8x the
+  // block: measured on 10MB text, one level under that point costs ~0.3% ratio
+  // while decompressing ~25% faster; larger tables mostly add TLB misses.
+  uint8_t level = 0;
+  while (level < mem_usage_ && ((uint64_t(2) * MB) << level) < 8 * block_size) {
+    ++level;
+  }
+  mem_usage_ = level;
+}
+
 void Archive::Algorithm::read(Stream* stream) {
   mem_usage_ = static_cast<uint8_t>(stream->get());
   algorithm_ = static_cast<Compressor::Type>(stream->get());
@@ -250,7 +266,7 @@ Filter* Archive::Algorithm::createFilter(Stream* stream, Analyzer* analyzer, Arc
           fout << s.Word() << std::endl;
         }
       }
-      auto& freq = builder.FrequencyCounter();
+      auto& freq = builder.GetFrequencyCounter();
       dict_filter->AddCodeWords(code_words.GetCodeWords(), code_words.num1_, code_words.num2_, code_words.num3_, &freq, dict_codes.Count());
       if (false) {
         std::cerr << std::endl << "Before " << freq.Sum() << std::endl;
@@ -794,6 +810,10 @@ uint64_t Archive::compress(const std::vector<FileInfo>& in_files) {
     const std::unique_ptr<SolidBlock>& b) {
     return a->total_size_ < b->total_size_;
   });
+  // Cap per-block memory before the block list (and its mem levels) is written.
+  for (const auto& b : blocks_) {
+    b->algorithm_.CapMemUsage(b->total_size_);
+  }
   writeBlocks();
   uint64_t total = 0;
   for (const auto& block : blocks_) {

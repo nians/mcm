@@ -260,16 +260,6 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
   uint8_t text_mask[] = { 15,0,0,2,15,0,8,3,2,12,13,1,3,0,7,9,12,0,0,0,0,0,0,2,0,6,0,0,9,0,0,0,12,7,14,9,7,11,4,11,10,4,9,14,9,8,7,6,5,5,5,5,5,5,5,5,5,5,14,9,2,15,13,4,2,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,2,4,4,4,4,4,4,5,4,4,3,3,10,1,3,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,4,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, };
   uint8_t text_mask2[] = { 4,2,0,7,2,0,13,0,0,5,4,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,11,2,10,8,5,6,3,9,14,7,7,3,1,5,15,10,0,0,0,0,0,0,0,0,0,0,1,13,13,8,7,7,14,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,15,6,12,14,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,12,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, };
   reorder_.Copy(text_reorder_);
-  if (true) {
-    std::ofstream of("of.txt");
-    for (size_t i = 0; i < 256; ++i) of << (size_t)reorder_.Backward(i) << ",";
-    of << std::endl;
-    for (size_t i = 0; i < 256; ++i) {
-      int c = reorder_.Backward(i);
-      of << i << " " << static_cast<int>(small_text_mask[c]) << "," << static_cast<int>(text_mask[c]) << " '";
-      of << (isspace(c) ? ' ' : static_cast<char>(c)) << "' ascii=" << (size_t)c << std::endl;
-    }
-  }
   for (size_t i = 0; i < 256; ++i) {
     // if (opts_) small_text_mask[i] = opts_[i];
     int ri = reorder_[i];
@@ -362,8 +352,8 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
 
 template <size_t kInputs, bool kUseSSE, typename HistoryType>
 inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Stream* out_stream, uint64_t max_count) {
-  BufferedStreamWriter<4 * KB> sout(out_stream);
-  BufferedStreamReader<4 * KB> sin(in_stream);
+  BufferedStreamWriter<64 * KB> sout(out_stream);
+  BufferedStreamReader<64 * KB> sin(in_stream);
   assert(in_stream != nullptr);
   assert(out_stream != nullptr);
   Detector detector(in_stream);
@@ -501,8 +491,8 @@ inline void CM<kInputs, kUseSSE, HistoryType>::compress(Stream* in_stream, Strea
 
 template <size_t kInputs, bool kUseSSE, typename HistoryType>
 inline void CM<kInputs, kUseSSE, HistoryType>::decompress(Stream* in_stream, Stream* out_stream, uint64_t max_count) {
-  BufferedStreamReader<4 * KB> sin(in_stream);
-  BufferedStreamWriter<4 * KB> sout(out_stream);
+  BufferedStreamReader<64 * KB> sin(in_stream);
+  BufferedStreamWriter<64 * KB> sout(out_stream);
   Detector detector(out_stream);
   if (!force_profile_) {
     detector.setOptVar(opt_var_);

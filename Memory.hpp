@@ -29,6 +29,7 @@
 class MemMap {
   void* storage;
   size_t size;
+  bool mapped_ = false;
 public:
   inline size_t getSize() const {
     return size;

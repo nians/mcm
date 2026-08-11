@@ -19,7 +19,7 @@
    - **P1 引擎工程优化**(不改格式,零压缩率损失):hugepage、fast 档默认内存降级、PGO 等 → 预期 1.5~2.5x(到 4~8 MB/s),同时是 P2 的地基。
    - **P2 新 fast mode 格式 "MCM-F2"**(核心):LZP/LZ77 字节对齐 token 流 + 上下文分桶半自适应 rANS 字面流 + 编码端用 CM 作率估计的近似最优解析 + **按块在“解码预算约束下最小化体积”的编码器选择机制**(守 3% 红线的同时守速度线)→ 单线程预期 **12~25x**。
    - **P3 块级并行解码**(chunk 独立模型 + offset 表):3~4x on 4 核,与 P2 叠加后 **≥ 20x 稳达标**,并留出压缩率安全边际。
-6. **前置阻断项(Phase 0)**:当前代码在 Linux/GCC13 下**二进制 profile 的 roundtrip 是坏的**(BIN32 语料 t/f/m 全部校验失败,且 f/m 档解压病理性变慢 17~45 倍)。已定位并修复一个真实 UB(`miss_len_` 未初始化,见 §8),但另有一个与规模/分段相关的编码端不确定性 bug 未根除。**任何性能改造必须先建立正确性基线**,否则 20x 无从验收。
+6. **前置阻断项(Phase 0)——已完成**:当前 master 在 Linux/GCC13 下二进制 profile 的 roundtrip 是坏的(BIN32 语料 t/f/m 全部校验失败,且 f/m 档解压病理性变慢 17~45 倍)。已根除两个真实 bug(binary 快路径解码端丢失高 nibble、`miss_len_` 未初始化 UB,见 §8),`test/roundtrip.sh` 矩阵 28/28 全绿。P1 工程优化也已落地(见 §6 P1 实测结果)。
 
 ---
 
@@ -290,28 +290,24 @@ chunk := freq_tables(delta 编码,分段刷新)
 
 ---
 
-## 8. 前置正确性问题(Phase 0,阻断项)
+## 8. 前置正确性问题(Phase 0)——已完成
 
-**现象**(本环境 GCC13/Linux,`-O3`,与指令集无关——SSE2 构建同现):
+**原始现象**(本环境 GCC13/Linux,`-O3`,与指令集无关——SSE2 构建同现):
 
 | 实验 | 结果 |
 |---|---|
 | BIN32 t8/f8/m8 roundtrip | **全部 BAD**;首个分歧字节 ~2.9MB(t8);f8/m8 解压病理性变慢(666s/247s vs 正常 ~14s) |
-| `-filter=none`(排除 X86 过滤器) | 仍 BAD 且挂慢 → **bug 在 CM 核/分段层,不在过滤器** |
-| 3MB 切片 | roundtrip OK → 与规模/多段相关 |
-| 同输入压缩两次 | 归档差 8.2M 字节 → **编码端不确定**(未初始化状态/分析器分段不稳定) |
-| 同归档解压两次 | 输出一致 → 解码端确定 |
+| `-filter=none`(排除 X86 过滤器) | 仍 BAD 且挂慢 → bug 在 CM 核,不在过滤器 |
+| 3MB 切片 | roundtrip OK → 触发条件与规模相关 |
+| 同归档解压两次 | 输出一致 → 解码端确定性的编解码不对称 |
+| 同输入压缩两次、跳过元数据前缀比较 | **数据段 bit-exact** → 编码端数据确定(早先观察到的 8.2M 字节差异是元数据 mtime 的 2 字节长度漂移造成的错位比较) |
 | 文本/XML 语料全部档位 | 全部 OK |
 
-**已修复**(本分支):`CM-inl.hpp` 中 `miss_len_` 仅在 `kStatistics` 编译开关下初始化,而它驱动 binary profile 的 `MissFastPath(25000)` 快路径判定——release 构建下读未初始化值,编码/解码两进程垃圾值不同即失同步。该修复必要但不充分(BIN32 仍 BAD),说明还有第二处。
+**根因 1(主因,已修复)**:binary profile 独有的 miss 快路径(`MissFastPath=25000`,`CM.hpp processByte` 快路径)在**解码端重组字节时丢失高 nibble**——第一个 nibble 只被折叠进状态树偏移 `base_ctx`,循环结束后 `c = ctx & 0xFF` 只含低 nibble(高 nibble 位置被 0x10 标志占据)。解码 bit 流本身同步、树状态更新正确,但**返回了错误的字节**;错字节进入 `update(c)` 污染上下文后全面失同步,并让 match model 追逐垃圾位置(即 f/m 档 17~45 倍病理变慢的原因)。触发需要连续 25000 字节 match-model 未命中,因此 3MB 切片无法复现、文本 profile(该阈值为 ∞)永不触发。修复:显式保存高 nibble 并在解码端重组 `c = (hi<<4)|lo`。编码端从未受影响(修复前后压缩产物 bit 相同),即**历史生成的文本类归档不受影响,历史二进制归档本来就无法正确解压**。
 
-**后续排查优先级**(证据指向):
-1. Analyzer/Detector 分段的确定性(同输入两次分段是否一致;段表与流长度的一致性校验器);
-2. valgrind memcheck `--track-origins=yes` 全程跑 BIN32 压缩+解压,抓 conditional-jump-on-uninitialised;
-3. `-fsanitize=undefined` 构建排 signed-overflow/aliasing(`MatchModel::search` 的 `reinterpret_cast<uint32_t*>` 未对齐读等);
-4. 二分:固定分段(单 block 强制 binary profile)复现与否,切分 CM 核 vs 分段层。
+**根因 2(次因,已修复)**:`miss_len_` 仅在 `kStatistics` 编译开关下初始化,而它驱动同一快路径的触发判定——release 构建下读未初始化值,编码/解码两进程垃圾值不同时即失同步(潜伏 UB,与根因 1 叠加)。
 
-**Phase 0 交付**:roundtrip 矩阵 CI(语料×档位×mem×filter 开关)+ 编码确定性测试(同输入两次压缩 bit-exact)+ 解码器 fuzz(AFL,防御损坏输入挂死——666s 病理案例说明解码器需要 sanity 界限)。
+**交付与验证**:`test/roundtrip.sh` 正确性矩阵(4 语料 × {t8,f8,m8,f6,f8-filter=none,f8-lzp=false} + 每语料编码确定性检查,共 28 项)**全部通过**;BIN32 三档解压时间恢复正常(14~21s)。矩阵应进 CI 每 PR 必跑;解码器 fuzz(AFL,防御损坏输入)仍为后续加固项。
 
 ---
 

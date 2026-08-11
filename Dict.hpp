@@ -212,7 +212,7 @@ public:
       words_.Clear();
     }
 
-    FrequencyCounter<256>& FrequencyCounter() {
+    ::FrequencyCounter<256>& GetFrequencyCounter() {
       return counter_;
     }
 

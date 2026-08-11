@@ -1,0 +1,8 @@
+/mcm
+mcm_p1
+mcm_sse2
+mcm_dbg
+mcm_fix
+*.o
+of.txt
+*.mcm
