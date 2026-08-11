@@ -43,8 +43,8 @@
 #define ALWAYS_INLINE __forceinline
 #define NO_INLINE __declspec(noinline)
 #else
-#define ALWAYS_INLINE __attribute__((always_inline))
-#define NO_INLINE __declspec(noinline)
+#define ALWAYS_INLINE inline __attribute__((always_inline))
+#define NO_INLINE __attribute__((noinline))
 #endif
 
 #define no_alias __restrict
@@ -246,7 +246,7 @@ ALWAYS_INLINE void fastcopy(uint8_t* no_alias out, const uint8_t* no_alias in, c
   } while (in < limit);
 }
 
-ALWAYS_INLINE void memcpy16unsafe(uint8_t* no_alias out, const uint8_t* no_alias in, const uint8_t* limit) {
+static ALWAYS_INLINE void memcpy16unsafe(uint8_t* no_alias out, const uint8_t* no_alias in, const uint8_t* limit) {
   do {
     copy16bytes(out, in);
     out += 16;

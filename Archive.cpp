@@ -33,6 +33,30 @@
 static const bool kTestFilter = false;
 static const size_t kSizePad = 10;
 
+// Analysis hook: when MCM_DUMP_FILTERED is set, tee everything the compressor
+// reads from the (post-filter) input stream into that file.
+class TeeReadStream : public Stream {
+public:
+  TeeReadStream(Stream* in, FILE* dump) : in_(in), dump_(dump) {}
+  int get() OVERRIDE {
+    int c = in_->get();
+    if (c != EOF && dump_ != nullptr) fputc(c, dump_);
+    return c;
+  }
+  size_t read(uint8_t* buf, size_t n) OVERRIDE {
+    size_t count = in_->read(buf, n);
+    if (count > 0 && dump_ != nullptr) fwrite(buf, 1, count, dump_);
+    return count;
+  }
+  void put(int c) OVERRIDE { in_->put(c); }
+  void write(const uint8_t* buf, size_t n) OVERRIDE { in_->write(buf, n); }
+  uint64_t tell() const OVERRIDE { return in_->tell(); }
+  void seek(uint64_t pos) OVERRIDE { in_->seek(pos); }
+private:
+  Stream* in_;
+  FILE* dump_;
+};
+
 Archive::Header::Header() {
   memcpy(magic_, getMagic(), kMagicStringLength);
 }
@@ -486,7 +510,7 @@ void testFilter(Stream* stream, Analyzer* analyzer) {
 
 static inline std::string smartExt(const std::string& ext) {
   if (ext == "h" || ext == "hpp" || ext == "inl" || ext == "cpp") return "c";
-  if (ext == "jpg" || ext == "zip" || ext == "7z" || ext == "apk" || ext == "mp3" || ext == "gif" || ext == "png") return "ÿ" + ext;
+  if (ext == "jpg" || ext == "zip" || ext == "7z" || ext == "apk" || ext == "mp3" || ext == "gif" || ext == "png") return "ï¿½" + ext;
   return ext;
 }
 
@@ -794,7 +818,15 @@ uint64_t Archive::compress(const std::vector<FileInfo>& in_files) {
     if (!comp->setOpts(opt_vars_)) return 0;
     {
       ProgressThread thr(&segstream, stream_, true, out_start);
-      comp->compress(in_stream, stream_);
+      const char* dump_path = getenv("MCM_DUMP_FILTERED");
+      if (dump_path != nullptr) {
+        FILE* dump_file = fopen(dump_path, "ab");
+        TeeReadStream tee(in_stream, dump_file);
+        comp->compress(&tee, stream_);
+        fclose(dump_file);
+      } else {
+        comp->compress(in_stream, stream_);
+      }
     }
     auto after_pos = stream_->tell();
 

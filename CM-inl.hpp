@@ -343,6 +343,10 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
   SetDataProfile(data_profile_);
   last_bytes_ = 0;
   SetUpCtxState();
+  // miss_len_ feeds the MissFastPath() coding decision, so it must be reset even
+  // in non-statistics builds: an uninitialized value here desynchronizes the
+  // encoder and decoder on profiles with a finite miss fast path (binary).
+  miss_len_ = 0;
   // Statistics
   if (kStatistics) {
     for (auto& c : mixer_skip_) c = 0;
@@ -351,7 +355,6 @@ inline void CM<kInputs, kUseSSE, HistoryType>::init() {
     lzp_bit_match_bytes_ = lzp_bit_miss_bytes_ = lzp_miss_bytes_ = normal_bytes_ = 0;
     for (auto& len : match_hits_) len = 0;
     for (auto& len : match_miss_) len = 0;
-    miss_len_ = 0;
     for (auto& c : miss_count_) c = 0;
     fast_bytes_ = 0;
   }
