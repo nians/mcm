@@ -144,6 +144,41 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Two-model CDF blend: out[i] = a[i] + ((b[i]-a[i])*w >> 8), w in [0,256).
+// For monotone inputs with unit gaps the floor error cancels against the
+// preserved gap (gap_out >= min(gap_a, gap_b) >= 1), so the blended CDF stays
+// strictly monotone and every nibble stays encodable. This is the mixing that
+// a lone sparse high-order context lacks: cold buckets keep w low and merely
+// shadow the dense model instead of hurting it.
+static const uint32_t kBlendBits = 16;   // high-order bucket count = 64K
+static const int kBlendInitW = 64;       // start at 25% high-order weight
+static const int kBlendMinW = 8;
+static const int kBlendMaxW = 248;
+
+ALWAYS_INLINE void BlendCdf(const uint16_t* a, const uint16_t* b, uint32_t w,
+                            uint16_t* out) {
+  out[0] = 0;
+  out[16] = static_cast<uint16_t>(kProbScale);
+  for (int i = 1; i < 16; ++i) {
+    const int32_t ai = a[i];
+    out[i] = static_cast<uint16_t>(ai + (((b[i] - ai) * static_cast<int32_t>(w)) >> 8));
+  }
+}
+
+// Weight adapts toward "how often the high-order model assigns the observed
+// symbol more probability" (binary target measured better than a three-level
+// proportional one on every corpus).
+ALWAYS_INLINE void UpdateBlendWeight(uint8_t* w, uint32_t fa, uint32_t fb) {
+  const int target = fb >= fa ? 256 : 0;
+  int nw = *w + ((target - *w) >> 5);
+  if (nw < kBlendMinW) nw = kBlendMinW;
+  if (nw > kBlendMaxW) nw = kBlendMaxW;
+  *w = static_cast<uint8_t>(nw);
+}
+
+
+
+// ---------------------------------------------------------------------------
 // rANS encoder. Symbols are recorded forward (while the models adapt), then a
 // segment is encoded in reverse into a scratch buffer.
 struct EncEvent {
@@ -161,6 +196,16 @@ public:
     events_.push_back(EncEvent{static_cast<uint16_t>(m.Start(sym)),
                                static_cast<uint16_t>(m.Freq(sym))});
     m.Update(sym);
+  }
+
+  ALWAYS_INLINE void PutNibBlended(NibModel& a, NibModel& b, uint8_t* w, size_t sym) {
+    uint16_t cdf[17];
+    BlendCdf(a.cdf_, b.cdf_, *w, cdf);
+    events_.push_back(EncEvent{cdf[sym],
+                               static_cast<uint16_t>(cdf[sym + 1] - cdf[sym])});
+    UpdateBlendWeight(w, a.Freq(sym), b.Freq(sym));
+    a.Update(sym);
+    b.Update(sym);
   }
 
   ALWAYS_INLINE void PutBits(uint32_t bits, uint32_t nbits) {
@@ -224,6 +269,20 @@ public:
     return sym;
   }
 
+  ALWAYS_INLINE size_t GetNibBlended(NibModel& a, NibModel& b, uint8_t* w) {
+    uint16_t cdf[17];
+    BlendCdf(a.cdf_, b.cdf_, *w, cdf);
+    const uint32_t slot = x_ & (kProbScale - 1);
+    size_t sym = 0;
+    while (cdf[sym + 1] <= slot) ++sym;
+    x_ = (cdf[sym + 1] - cdf[sym]) * (x_ >> kProbBits) + slot - cdf[sym];
+    while (x_ < kRansL) x_ = (x_ << 8) | Get();
+    UpdateBlendWeight(w, a.Freq(sym), b.Freq(sym));
+    a.Update(sym);
+    b.Update(sym);
+    return sym;
+  }
+
   ALWAYS_INLINE uint32_t GetBits(uint32_t nbits) {
     uint32_t bits = 0, got = 0;
     while (nbits > 15) {
@@ -274,6 +333,27 @@ struct Models {
   NibModel dist_hi[2];                   // ctx: len >= 8
   NibModel dist_lo[2][4];                // ctx: (len >= 8, hi)
   NibModel dist_align[2];                // low 4 bits of large distances
+
+  // High-order (o3) companions blended into the literal models.
+  NibModel blend_hi[1u << kBlendBits];
+  NibModel blend_lo[1u << kBlendBits];
+  uint8_t bw_hi[1u << kBlendBits];
+  uint8_t bw_lo[1u << kBlendBits];
+
+  Models() {
+    memset(bw_hi, kBlendInitW, sizeof(bw_hi));
+    memset(bw_lo, kBlendInitW, sizeof(bw_lo));
+  }
+
+  ALWAYS_INLINE static size_t O3Hash(uint32_t p1, uint32_t p2, uint32_t p3) {
+    const uint32_t v = p1 | (p2 << 8) | (p3 << 16);
+    return (v * 2654435761u) >> (32 - kBlendBits);
+  }
+  // Note: an order-4 companion context and a cold-bucket blend bypass were
+  // both measured slightly worse than plain o3 + always-blend; o3 it is.
+  ALWAYS_INLINE static size_t LoBucket(size_t o3h, uint32_t hi) {
+    return (o3h ^ (hi * 0x9E3Bu)) & ((1u << kBlendBits) - 1);
+  }
 
   ALWAYS_INLINE static size_t LitPrimary(uint32_t prev, bool post_match, uint32_t match_byte) {
     return post_match ? 256u + match_byte : prev;
@@ -428,7 +508,8 @@ ALWAYS_INLINE size_t DecodeLen(SegmentDecoder& dec, Models& models, size_t lctx,
 class F2Encoder {
 public:
   void CompressChunk(const uint8_t* in, size_t n, std::vector<uint8_t>& out,
-                     Models& models, uint32_t& prev1_io, uint32_t& prev2_io) {
+                     Models& models, uint32_t& prev1_io, uint32_t& prev2_io,
+                     uint32_t& prev3_io) {
     mf_.Reset(in, n);
     lzp_.Reset();
     // The raw-store escape below must also discard this chunk's model updates,
@@ -440,7 +521,7 @@ public:
     std::vector<uint8_t> data;
     size_t pos = 0;
     size_t reps[kNumReps] = {1, 2, 3};
-    uint32_t prev1 = prev1_io, prev2 = prev2_io;
+    uint32_t prev1 = prev1_io, prev2 = prev2_io, prev3 = prev3_io;
     uint32_t prev_kind = kTokLit, prev_kind2 = kTokLit;
     bool post_match = false;
     size_t miss_run = 0, next_search = 0;
@@ -497,9 +578,13 @@ public:
       const uint32_t match_byte = post_match ? in[pos - reps[0]] : 0;
       const size_t lit_primary = Models::LitPrimary(prev1, post_match, match_byte);
       const uint32_t c0 = in[pos];
+      const size_t o3h = Models::O3Hash(prev1, prev2, prev3);
       const uint32_t lit_cost = CostNib(tokm, kTokLit) +
-        CostNib(models.lit_hi[Models::LitHiCtx(lit_primary, prev2)], c0 >> 4) +
-        CostNib(models.lit_lo[Models::LitLoCtx(lit_primary, c0 >> 4)], c0 & 15);
+        CostNibBlended(models.lit_hi[Models::LitHiCtx(lit_primary, prev2)],
+                       models.blend_hi[o3h], models.bw_hi[o3h], c0 >> 4) +
+        CostNibBlended(models.lit_lo[Models::LitLoCtx(lit_primary, c0 >> 4)],
+                       models.blend_lo[Models::LoBucket(o3h, c0 >> 4)],
+                       models.bw_lo[Models::LoBucket(o3h, c0 >> 4)], c0 & 15);
 
       uint32_t rep_avg = ~0u;
       if (best_rep_len != 0) {
@@ -528,7 +613,7 @@ public:
         // Nothing beats coding one literal.
         mf_.Insert(pos);
         EmitTok(models, prev_kind, prev_kind2, kTokLit);
-        EmitLit(models, in, pos, reps, prev1, prev2, post_match);
+        EmitLit(models, in, pos, reps, prev1, prev2, prev3, post_match);
         ++seg_tokens;
         ++miss_run;
         if (seg_tokens == kSegTokens) FlushSegment(seg_meta, data, seg_tokens);
@@ -546,7 +631,7 @@ public:
             const uint32_t next_cost = MatchCost(models, tokm, l2, d2, kTokLit);
             if ((lit_cost + next_cost) / static_cast<uint32_t>(1 + l2) <= match_avg) {
               EmitTok(models, prev_kind, prev_kind2, kTokLit);
-              EmitLit(models, in, pos, reps, prev1, prev2, post_match);
+              EmitLit(models, in, pos, reps, prev1, prev2, prev3, post_match);
               ++seg_tokens;
               if (seg_tokens == kSegTokens) FlushSegment(seg_meta, data, seg_tokens);
               continue;
@@ -584,6 +669,7 @@ public:
       }
       prev1 = in[pos - 1];
       prev2 = pos >= 2 ? in[pos - 2] : prev1;
+      prev3 = pos >= 3 ? in[pos - 3] : prev2;
       post_match = true;
       ++seg_tokens;
       if (seg_tokens == kSegTokens) FlushSegment(seg_meta, data, seg_tokens);
@@ -610,11 +696,13 @@ public:
       body.insert(body.end(), in, in + n);
       prev1 = in[n - 1];
       prev2 = n >= 2 ? in[n - 2] : prev1;
+      prev3 = n >= 3 ? in[n - 3] : prev2;
     }
     WriteLeb(out, body.size());
     out.insert(out.end(), body.begin(), body.end());
     prev1_io = prev1;
     prev2_io = prev2;
+    prev3_io = prev3;
   }
 
   static void WriteLeb(std::vector<uint8_t>& out, size_t v) {
@@ -635,13 +723,18 @@ private:
 
   ALWAYS_INLINE void EmitLit(Models& models, const uint8_t* in, size_t& pos,
                              const size_t* reps, uint32_t& prev1, uint32_t& prev2,
-                             bool& post_match) {
+                             uint32_t& prev3, bool& post_match) {
     const uint32_t c = in[pos];
     const uint32_t match_byte = post_match ? in[pos - reps[0]] : 0;
     const uint32_t hi = c >> 4;
     const size_t primary = Models::LitPrimary(prev1, post_match, match_byte);
-    enc_.PutNib(models.lit_hi[Models::LitHiCtx(primary, prev2)], hi);
-    enc_.PutNib(models.lit_lo[Models::LitLoCtx(primary, hi)], c & 15);
+    const size_t o3h = Models::O3Hash(prev1, prev2, prev3);
+    enc_.PutNibBlended(models.lit_hi[Models::LitHiCtx(primary, prev2)],
+                       models.blend_hi[o3h], &models.bw_hi[o3h], hi);
+    const size_t lob = Models::LoBucket(o3h, hi);
+    enc_.PutNibBlended(models.lit_lo[Models::LitLoCtx(primary, hi)],
+                       models.blend_lo[lob], &models.bw_lo[lob], c & 15);
+    prev3 = prev2;
     prev2 = prev1;
     prev1 = c;
     ++pos;
@@ -661,6 +754,16 @@ private:
     } else if (ebits > 0) {
       enc_.PutBits(extra, ebits);
     }
+  }
+
+  ALWAYS_INLINE static uint32_t CostNibBlended(const NibModel& a, const NibModel& b,
+                                               uint32_t w, size_t sym) {
+    const int32_t a0 = a.cdf_[sym], a1 = a.cdf_[sym + 1];
+    const int32_t b0 = b.cdf_[sym], b1 = b.cdf_[sym + 1];
+    const int32_t c0 = sym == 0 ? 0 : a0 + (((b0 - a0) * static_cast<int32_t>(w)) >> 8);
+    const int32_t c1 = sym == 15 ? static_cast<int32_t>(kProbScale)
+                                 : a1 + (((b1 - a1) * static_cast<int32_t>(w)) >> 8);
+    return CostTable()[static_cast<uint32_t>(c1 - c0)];
   }
 
   ALWAYS_INLINE static uint32_t LenCost(const Models& models, size_t lctx,
@@ -727,7 +830,7 @@ public:
   // bytes to out and returns raw_len, or 0 on corrupt input.
   size_t DecompressChunk(const uint8_t* in, size_t in_len, uint8_t* out,
                          size_t out_cap, Models& models,
-                         uint32_t& prev1_io, uint32_t& prev2_io) {
+                         uint32_t& prev1_io, uint32_t& prev2_io, uint32_t& prev3_io) {
     const uint8_t* p = in;
     const uint8_t* in_end = in + in_len;
     const size_t raw_len = ReadLeb(p, in_end);
@@ -738,6 +841,7 @@ public:
       memcpy(out, p, raw_len);
       prev1_io = raw_len ? out[raw_len - 1] : prev1_io;
       prev2_io = raw_len >= 2 ? out[raw_len - 2] : prev1_io;
+      prev3_io = raw_len >= 3 ? out[raw_len - 3] : prev2_io;
       return raw_len;
     }
     const size_t n_segments = ReadLeb(p, in_end);
@@ -745,7 +849,7 @@ public:
     size_t lzp_ptr = 0;
     size_t pos = 0;
     size_t reps[kNumReps] = {1, 2, 3};
-    uint32_t prev1 = prev1_io, prev2 = prev2_io;
+    uint32_t prev1 = prev1_io, prev2 = prev2_io, prev3 = prev3_io;
     uint32_t prev_kind = kTokLit, prev_kind2 = kTokLit;
     bool post_match = false;
     for (size_t s = 0; s < n_segments; ++s) {
@@ -761,10 +865,17 @@ public:
           if (pos >= raw_len) return 0;
           const uint32_t match_byte = post_match ? out[pos - reps[0]] : 0;
           const size_t primary = Models::LitPrimary(prev1, post_match, match_byte);
-          const size_t hi = dec_.GetNib(models.lit_hi[Models::LitHiCtx(primary, prev2)]);
-          const size_t lo = dec_.GetNib(models.lit_lo[Models::LitLoCtx(primary, hi)]);
+          const size_t o3h = Models::O3Hash(prev1, prev2, prev3);
+          const size_t hi = dec_.GetNibBlended(
+            models.lit_hi[Models::LitHiCtx(primary, prev2)],
+            models.blend_hi[o3h], &models.bw_hi[o3h]);
+          const size_t lob = Models::LoBucket(o3h, hi);
+          const size_t lo = dec_.GetNibBlended(
+            models.lit_lo[Models::LitLoCtx(primary, hi)],
+            models.blend_lo[lob], &models.bw_lo[lob]);
           const uint8_t c = static_cast<uint8_t>((hi << 4) | lo);
           out[pos++] = c;
+          prev3 = prev2;
           prev2 = prev1;
           prev1 = c;
           post_match = false;
@@ -809,6 +920,7 @@ public:
           pos += len;
           prev1 = out[pos - 1];
           prev2 = pos >= 2 ? out[pos - 2] : prev1;
+          prev3 = pos >= 3 ? out[pos - 3] : prev2;
           post_match = true;
         } else {
           return 0;  // corrupt
@@ -820,6 +932,7 @@ public:
     if (pos != raw_len) return 0;
     prev1_io = prev1;
     prev2_io = prev2;
+    prev3_io = prev3;
     return raw_len;
   }
 
@@ -857,11 +970,11 @@ private:
 inline void MemCompress(const uint8_t* in, size_t n, std::vector<uint8_t>& out) {
   F2Encoder enc;
   std::vector<Models> models(1);
-  uint32_t prev1 = 0, prev2 = 0;
+  uint32_t prev1 = 0, prev2 = 0, prev3 = 0;
   size_t pos = 0;
   while (pos < n) {
     const size_t chunk = std::min(n - pos, kChunkSize);
-    enc.CompressChunk(in + pos, chunk, out, models[0], prev1, prev2);
+    enc.CompressChunk(in + pos, chunk, out, models[0], prev1, prev2, prev3);
     pos += chunk;
   }
 }
@@ -869,7 +982,7 @@ inline void MemCompress(const uint8_t* in, size_t n, std::vector<uint8_t>& out) 
 inline bool MemDecompress(const uint8_t* in, size_t n, uint8_t* out, size_t out_n) {
   F2Decoder dec;
   std::vector<Models> models(1);
-  uint32_t prev1 = 0, prev2 = 0;
+  uint32_t prev1 = 0, prev2 = 0, prev3 = 0;
   size_t in_pos = 0, out_pos = 0;
   while (out_pos < out_n && in_pos < n) {
     const uint8_t* p = in + in_pos;
@@ -877,7 +990,7 @@ inline bool MemDecompress(const uint8_t* in, size_t n, uint8_t* out, size_t out_
     const size_t header = static_cast<size_t>(p - (in + in_pos));
     if (payload == 0 || in_pos + header + payload > n) return false;
     const size_t got = dec.DecompressChunk(p, payload, out + out_pos, out_n - out_pos,
-                                           models[0], prev1, prev2);
+                                           models[0], prev1, prev2, prev3);
     if (got == 0) return false;
     in_pos += header + payload;
     out_pos += got;
@@ -922,6 +1035,11 @@ public:
   }
 
   virtual void compress(Stream* in, Stream* out, uint64_t max_count) OVERRIDE {
+    // F2 models and byte context run continuously across sections (mirroring
+    // the decoder); a section that ships as CM rolls them back via snapshot.
+    F2Encoder enc;
+    std::vector<Models> models(1), snapshot(1);
+    uint32_t prev1 = 0, prev2 = 0, prev3 = 0;
     std::vector<uint8_t> buf;
     while (max_count > 0) {
       const size_t want = static_cast<size_t>(std::min<uint64_t>(max_count, kSectionSize));
@@ -933,12 +1051,14 @@ public:
         got += r;
       }
       if (got == 0) break;
-      CompressSection(buf.data(), got, out);
+      CompressSection(buf.data(), got, out, enc, models, snapshot, prev1, prev2, prev3);
       max_count -= got;
     }
   }
 
-  void CompressSection(const uint8_t* data, size_t n, Stream* out) {
+  void CompressSection(const uint8_t* data, size_t n, Stream* out, F2Encoder& enc,
+                       std::vector<Models>& models, std::vector<Models>& snapshot,
+                       uint32_t& prev1, uint32_t& prev2, uint32_t& prev3) {
     // Reference: the section as one continuous CM fast-mode stream.
     std::vector<uint8_t> cm_data;
     const uint8_t cm_mem = CmMemForChunk(n);
@@ -948,17 +1068,17 @@ public:
       WriteVectorStream wvs(&cm_data);
       cm_engine.compress(&rms, &wvs, n);
     }
-    // Candidate: the section as F2 chunks.
+    // Candidate: the section as F2 chunks (advances the shared models).
+    snapshot[0] = models[0];
+    const uint32_t old1 = prev1, old2 = prev2, old3 = prev3;
+    (void)old2; (void)old3;
     std::vector<uint8_t> f2_data;
     {
-      F2Encoder enc;
-      std::vector<Models> models(1);
-      uint32_t prev1 = 0, prev2 = 0;
       size_t pos = 0;
       while (pos < n) {
         const size_t chunk = std::min(n - pos, kChunkSize);
         std::vector<uint8_t> payload;
-        enc.CompressChunk(data + pos, chunk, payload, models[0], prev1, prev2);
+        enc.CompressChunk(data + pos, chunk, payload, models[0], prev1, prev2, prev3);
         F2Encoder::WriteLeb(f2_data, payload.size());
         f2_data.insert(f2_data.end(), payload.begin(), payload.end());
         pos += chunk;
@@ -968,6 +1088,12 @@ public:
     if (uint64_t(f2_data.size()) <= gate) {
       out->write(f2_data.data(), f2_data.size());
     } else {
+      // CM section: undo the F2 trial's model advances, set the byte context
+      // from the raw tail exactly like the decoder will.
+      models[0] = snapshot[0];
+      prev1 = n ? data[n - 1] : old1;
+      prev2 = n >= 2 ? data[n - 2] : prev1;
+      prev3 = n >= 3 ? data[n - 3] : prev2;
       std::vector<uint8_t> payload;
       F2Encoder::WriteLeb(payload, n);
       payload.push_back(kModeCM);
@@ -983,7 +1109,7 @@ public:
   virtual void decompress(Stream* in, Stream* out, uint64_t max_count) OVERRIDE {
     F2Decoder dec;
     std::vector<Models> models(1);
-    uint32_t prev1 = 0, prev2 = 0;
+    uint32_t prev1 = 0, prev2 = 0, prev3 = 0;
     std::vector<uint8_t> comp;
     std::vector<uint8_t> raw(64 * KB);
     while (max_count > 0) {
@@ -1019,9 +1145,10 @@ public:
         got = raw_len;
         prev1 = raw_len ? raw[raw_len - 1] : prev1;
         prev2 = raw_len >= 2 ? raw[raw_len - 2] : prev1;
+        prev3 = raw_len >= 3 ? raw[raw_len - 3] : prev2;
       } else {
         got = dec.DecompressChunk(comp.data(), payload, raw.data(), raw.size(),
-                                  models[0], prev1, prev2);
+                                  models[0], prev1, prev2, prev3);
         if (got == 0) return;
       }
       out->write(raw.data(), got);
