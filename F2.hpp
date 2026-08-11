@@ -71,6 +71,19 @@ enum TokKind {
 static const uint32_t kLzpBits = 18;
 static const size_t kMinLzpLen = 2;
 static const uint32_t kLzpNil = 0xFFFFFFFFu;
+static const uint16_t kNoPred = 0xFFFF;
+
+#ifdef F2_TRACE
+#include <cstdio>
+// Debug-only dual traces: encoder and decoder each append one line per token
+// with the full context tuple; diffing the two files pinpoints the first
+// state divergence. Never enabled in production builds.
+inline FILE* F2TraceFile(int which) {
+  static FILE* f[2] = {nullptr, nullptr};
+  if (!f[which]) f[which] = fopen(which ? "f2_dec.trace" : "f2_enc.trace", "w");
+  return f[which];
+}
+#endif
 
 class LzpTable {
 public:
@@ -530,13 +543,21 @@ public:
     const uint16_t* cost_tab = CostTable();
     (void)cost_tab;
 
-    size_t lzp_ptr = 0;
+    lzp_ptr_ = 0;
     // ---- Optimal parse: price-frozen DP over short spans, then emission with
     // live model updates. Prices are refreshed every span, so the staleness
     // window is ~kOptSpan tokens; the DP itself never touches the models, so
     // this is a pure encoder-side upgrade with zero decode cost.
     static const size_t kOptSpan = 512;
     static const size_t kFastLen = 64;  // candidates this long truncate the span
+    // Lagrangian decode-speed bias, in 1/16-bit units per decode event: the DP
+    // minimizes bits + bias * events, so fragmenting into many small tokens
+    // must pay for its decode cost. 0 = pure rate optimization.
+#ifdef F2_SPEED_BIAS
+    static const uint32_t kSpeedBias = F2_SPEED_BIAS;
+#else
+    static const uint32_t kSpeedBias = 4;
+#endif
     struct Par { uint32_t cost; uint32_t dist; uint16_t len; uint8_t kind; };
     std::vector<Par> dp(kOptSpan + kFastLen + 1);
     std::vector<Par> toks;
@@ -545,6 +566,8 @@ public:
       const size_t dp_cap = std::min(n - pos, kOptSpan + kFastLen);
       for (size_t j = 0; j <= dp_cap; ++j) dp[j].cost = 0xFFFFFFFFu;
       dp[0].cost = 0;
+      pred_.assign(span, kNoPred);
+      pred_base_ = pos;
       const NibModel& tokm = models.tok[prev_kind * kTokKinds + prev_kind2];
       uint32_t tok_price[kTokKinds];
       for (uint32_t k = 0; k < kTokKinds; ++k) tok_price[k] = CostNib(tokm, k);
@@ -562,25 +585,32 @@ public:
       bool has_break = false;
       for (size_t i = 0; i < span && !has_break; ++i) {
         const size_t abs = pos + i;
-        for (; lzp_ptr < abs; ++lzp_ptr) lzp_.Insert(in, lzp_ptr);
+        for (; lzp_ptr_ < abs; ++lzp_ptr_) lzp_.Insert(in, lzp_ptr_);
         const uint32_t base_cost = dp[i].cost;
         const size_t cand_cap = std::min(n - abs, kMaxMatchLen + kMinMatch);
 
-        // Literal edge (exact bytes; the post-match literal context is
+        // LZP candidate first: its next byte doubles as the literal
+        // prediction context. The table state here (inserts < abs) is exactly
+        // the decoder's state at this position, so the recorded prediction is
+        // what the decoder will recompute.
+        const uint32_t lzp_cand = lzp_.Candidate(in, abs);
+        pred_[i] = lzp_cand != kLzpNil ? in[lzp_cand] : kNoPred;
+        // Literal edge (exact bytes; the post-match fallback context is
         // approximated as absent while pricing).
         {
           const uint32_t p1 = abs >= 1 ? in[abs - 1] : (i == 0 ? prev1 : 0);
           const uint32_t p2 = abs >= 2 ? in[abs - 2] : (i == 0 ? prev2 : 0);
           const uint32_t p3 = abs >= 3 ? in[abs - 3] : (i == 0 ? prev3 : 0);
           const uint32_t c0 = in[abs];
+          const size_t primary = pred_[i] != kNoPred ? 256u + pred_[i] : (p1 & 0xFF);
           const size_t o3h = Models::O3Hash(p1, p2, p3);
           const uint32_t lc = tok_price[kTokLit] +
-            CostNibBlended(models.lit_hi[Models::LitHiCtx(p1 & 0xFF, p2)],
+            CostNibBlended(models.lit_hi[Models::LitHiCtx(primary, p2)],
                            models.blend_hi[o3h], models.bw_hi[o3h], c0 >> 4) +
-            CostNibBlended(models.lit_lo[Models::LitLoCtx(p1 & 0xFF, c0 >> 4)],
+            CostNibBlended(models.lit_lo[Models::LitLoCtx(primary, c0 >> 4)],
                            models.blend_lo[Models::LoBucket(o3h, c0 >> 4)],
                            models.bw_lo[Models::LoBucket(o3h, c0 >> 4)], c0 & 15);
-          relax(i + 1, base_cost + lc, kTokLit, 1, 0);
+          relax(i + 1, base_cost + lc + kSpeedBias * 4, kTokLit, 1, 0);
         }
         // Rep candidates against the span-entry rep list; emission re-maps or
         // falls back to an explicit match if the live list drifted, so the
@@ -607,14 +637,13 @@ public:
           }
           const size_t lctx = r == 0 ? 1 : 2;
           for (size_t l = kMinRep; l <= len; ++l) {
-            relax(i + l, base_cost + tok_price[kTokRep0 + r] +
+            relax(i + l, base_cost + tok_price[kTokRep0 + r] + kSpeedBias * 3 +
                   LenCost(models, lctx, l, kMinRep), kTokRep0 + r, l, d);
           }
         }
-        // LZP candidate (table state is position-driven, so the distance the
-        // decoder will recompute at this position is exactly this one).
+        // LZP copy-token candidates (same candidate as above).
         {
-          const uint32_t cand = lzp_.Candidate(in, abs);
+          const uint32_t cand = lzp_cand;
           if (cand != kLzpNil) {
             const uint8_t* a = in + abs;
             const uint8_t* b = in + cand;
@@ -632,7 +661,7 @@ public:
               }
             } else if (len >= kMinLzpLen) {
               for (size_t l = kMinLzpLen; l <= len; ++l) {
-                relax(i + l, base_cost + tok_price[kTokLzp] +
+                relax(i + l, base_cost + tok_price[kTokLzp] + kSpeedBias * 3 +
                       LenCost(models, 4, l, kMinLzpLen), kTokLzp, l, abs - cand);
               }
             }
@@ -654,7 +683,7 @@ public:
           } else if (mlen != 0) {
             const uint32_t dist_price = DistCost(models, mlen, dist);
             for (size_t l = kMinMatch; l <= mlen; ++l) {
-              relax(i + l, base_cost + tok_price[kTokMatch] +
+              relax(i + l, base_cost + tok_price[kTokMatch] + kSpeedBias * 5 +
                     LenCost(models, 0, l, kMinMatch) + dist_price, kTokMatch, l, dist);
             }
           }
@@ -741,10 +770,33 @@ private:
                              const size_t* reps, uint32_t& prev1, uint32_t& prev2,
                              uint32_t& prev3, bool& post_match) {
     const uint32_t c = in[pos];
-    const uint32_t match_byte = post_match ? in[pos - reps[0]] : 0;
     const uint32_t hi = c >> 4;
-    const size_t primary = Models::LitPrimary(prev1, post_match, match_byte);
+    const size_t rel = pos - pred_base_;
+    uint32_t pred;
+    if (rel < pred_.size()) {
+      pred = pred_[rel];
+    } else {
+      // Beyond the scanned span (a short rep crossing the span end got demoted
+      // to literals): the snapshot has no entry, so query live. The scan's
+      // insert pointer is still below pos here, so after catching up the table
+      // state is exactly the decoder's (inserts [0, pos)) -- using kNoPred
+      // instead desynchronizes the literal context and corrupts the stream.
+      for (; lzp_ptr_ < pos; ++lzp_ptr_) lzp_.Insert(in, lzp_ptr_);
+      const uint32_t cand = lzp_.Candidate(in, pos);
+      pred = cand != kLzpNil ? in[cand] : kNoPred;
+    }
+    size_t primary;
+    if (pred != kNoPred) {
+      primary = 256u + pred;
+    } else {
+      const uint32_t match_byte = post_match ? in[pos - reps[0]] : 0;
+      primary = Models::LitPrimary(prev1, post_match, match_byte);
+    }
     const size_t o3h = Models::O3Hash(prev1, prev2, prev3);
+#ifdef F2_TRACE
+    fprintf(F2TraceFile(0), "L %zu pri=%zu o3=%zu p1=%u p2=%u p3=%u pm=%d r0=%zu\n",
+            pos, primary, o3h, prev1, prev2, prev3, (int)post_match, reps[0]);
+#endif
     enc_.PutNibBlended(models.lit_hi[Models::LitHiCtx(primary, prev2)],
                        models.blend_hi[o3h], &models.bw_hi[o3h], hi);
     const size_t lob = Models::LoBucket(o3h, hi);
@@ -869,6 +921,10 @@ private:
         for (size_t r = r_idx; r > 0; --r) reps[r] = reps[r - 1];
         reps[0] = d;
       }
+#ifdef F2_TRACE
+      fprintf(F2TraceFile(0), "T %zu k=%u len=%zu dist=%zu r0=%zu r1=%zu r2=%zu\n",
+              pos, kind, len, dist, reps[0], reps[1], reps[2]);
+#endif
       pos += len;
       prev1 = in[pos - 1];
       prev2 = pos >= 2 ? in[pos - 2] : prev1;
@@ -920,6 +976,9 @@ private:
   SegmentEncoder enc_;
   LzpTable lzp_;
   std::vector<Models> models_backup_;
+  std::vector<uint16_t> pred_;
+  size_t pred_base_ = 0;
+  size_t lzp_ptr_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -962,9 +1021,19 @@ public:
         const size_t kind = dec_.GetNib(models.tok[prev_kind * kTokKinds + prev_kind2]);
         if (kind == kTokLit) {
           if (pos >= raw_len) return 0;
-          const uint32_t match_byte = post_match ? out[pos - reps[0]] : 0;
-          const size_t primary = Models::LitPrimary(prev1, post_match, match_byte);
+          const uint32_t lzp_cand = lzp_.Candidate(out, pos);
+          size_t primary;
+          if (lzp_cand != kLzpNil) {
+            primary = 256u + out[lzp_cand];
+          } else {
+            const uint32_t match_byte = post_match ? out[pos - reps[0]] : 0;
+            primary = Models::LitPrimary(prev1, post_match, match_byte);
+          }
           const size_t o3h = Models::O3Hash(prev1, prev2, prev3);
+#ifdef F2_TRACE
+          fprintf(F2TraceFile(1), "L %zu pri=%zu o3=%zu p1=%u p2=%u p3=%u pm=%d r0=%zu\n",
+                  pos, primary, o3h, prev1, prev2, prev3, (int)post_match, reps[0]);
+#endif
           const size_t hi = dec_.GetNibBlended(
             models.lit_hi[Models::LitHiCtx(primary, prev2)],
             models.blend_hi[o3h], &models.bw_hi[o3h]);
@@ -1015,6 +1084,10 @@ public:
             reps[0] = dist;
           }
           if (dist == 0 || dist > pos || len > raw_len - pos) return 0;
+#ifdef F2_TRACE
+          fprintf(F2TraceFile(1), "T %zu k=%zu len=%zu dist=%zu r0=%zu r1=%zu r2=%zu\n",
+                  pos, kind, len, dist, reps[0], reps[1], reps[2]);
+#endif
           CopyMatch(out, pos, dist, len);
           pos += len;
           prev1 = out[pos - 1];
