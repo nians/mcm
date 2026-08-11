@@ -896,10 +896,19 @@ inline bool MemDecompress(const uint8_t* in, size_t n, uint8_t* out, size_t out_
 // narrows corpus by corpus.
 class F2 : public Compressor {
 public:
-  // 2% against the chunked-CM total; the extra percent of the 3% target is
-  // reserved for the CM chunking penalty relative to a continuous -f stream.
-  enum : uint64_t { kBudgetPermille = 20 };
+  // The ratio guarantee is enforced at section level against a CONTINUOUS CM
+  // reference: a section is emitted as F2 chunks only if their total stays
+  // within kGatePermille of the whole-section CM stream, otherwise the
+  // section ships as that CM stream itself. A per-chunk budget against a
+  // chunked CM reference is NOT sound -- chunking can inflate the reference
+  // arbitrarily on data with long-range redundancy (measured +53% on a
+  // corpus of three nearly identical trees), which would let F2 through the
+  // gate while blowing the real bound.
+  enum : uint64_t { kGatePermille = 30 };
   enum : uint8_t { kModeCM = 2 };
+  // Sections cap the buffering; losses across 256MB section boundaries are
+  // negligible next to the 3% budget.
+  static const size_t kSectionSize = 256 * MB;
 
   F2(const FrequencyCounter<256>& freq, Detector::Profile profile)
     : freq_(freq), profile_(profile) {}
@@ -913,61 +922,61 @@ public:
   }
 
   virtual void compress(Stream* in, Stream* out, uint64_t max_count) OVERRIDE {
-    F2Encoder enc;
-    std::vector<Models> models(1);
-    std::vector<Models> snapshot(1);
-    uint32_t prev1 = 0, prev2 = 0;
-    std::vector<uint8_t> buf(kChunkSize);
-    std::vector<uint8_t> f2_payload;
-    uint64_t cm_total = 0;   // cumulative CM sizes (the reference encoding)
-    int64_t spent = 0;       // cumulative F2 overhead vs that reference
+    std::vector<uint8_t> buf;
     while (max_count > 0) {
-      const size_t want = static_cast<size_t>(std::min<uint64_t>(max_count, kChunkSize));
-      const size_t got = in->read(buf.data(), want);
+      const size_t want = static_cast<size_t>(std::min<uint64_t>(max_count, kSectionSize));
+      buf.resize(want);
+      size_t got = 0;
+      while (got < want) {
+        const size_t r = in->read(buf.data() + got, want - got);
+        if (r == 0) break;
+        got += r;
+      }
       if (got == 0) break;
-      // Trial 1: F2 (adapts models; snapshot lets us roll back if CM wins).
-      snapshot[0] = models[0];
-      const uint32_t old_prev1 = prev1, old_prev2 = prev2;
-      f2_payload.clear();
-      enc.CompressChunk(buf.data(), got, f2_payload, models[0], prev1, prev2);
-      // Trial 2: embedded CM fast engine over the same bytes.
-      std::vector<uint8_t> cm_data;
-      const uint8_t cm_mem = CmMemForChunk(got);
-      {
-        cm::CM<4, false> cm_engine(freq_, cm_mem, true, profile_);
-        ReadMemoryStream rms(buf.data(), buf.data() + got);
-        WriteVectorStream wvs(&cm_data);
-        cm_engine.compress(&rms, &wvs, got);
-      }
-      cm_total += cm_data.size();
-      const int64_t extra = static_cast<int64_t>(f2_payload.size()) -
-        static_cast<int64_t>(cm_data.size());
-      const int64_t budget = static_cast<int64_t>(cm_total * kBudgetPermille / 1000);
-      if (spent + extra <= budget) {
-        // F2 stays within the ratio budget: keep it.
-        spent += extra;
-        scratch_.clear();
-        F2Encoder::WriteLeb(scratch_, f2_payload.size());
-        out->write(scratch_.data(), scratch_.size());
-        out->write(f2_payload.data(), f2_payload.size());
-      } else {
-        // CM wins: roll back the F2 model updates so the decoder (which will
-        // never see this chunk's F2 symbols) stays in sync.
-        models[0] = snapshot[0];
-        prev1 = got ? buf[got - 1] : old_prev1;
-        prev2 = got >= 2 ? buf[got - 2] : old_prev1;
-        (void)old_prev2;
-        scratch_.clear();
-        std::vector<uint8_t> payload;
-        F2Encoder::WriteLeb(payload, got);
-        payload.push_back(kModeCM);
-        payload.push_back(cm_mem);
-        payload.insert(payload.end(), cm_data.begin(), cm_data.end());
-        F2Encoder::WriteLeb(scratch_, payload.size());
-        out->write(scratch_.data(), scratch_.size());
-        out->write(payload.data(), payload.size());
-      }
+      CompressSection(buf.data(), got, out);
       max_count -= got;
+    }
+  }
+
+  void CompressSection(const uint8_t* data, size_t n, Stream* out) {
+    // Reference: the section as one continuous CM fast-mode stream.
+    std::vector<uint8_t> cm_data;
+    const uint8_t cm_mem = CmMemForChunk(n);
+    {
+      cm::CM<4, false> cm_engine(freq_, cm_mem, true, profile_);
+      ReadMemoryStream rms(data, data + n);
+      WriteVectorStream wvs(&cm_data);
+      cm_engine.compress(&rms, &wvs, n);
+    }
+    // Candidate: the section as F2 chunks.
+    std::vector<uint8_t> f2_data;
+    {
+      F2Encoder enc;
+      std::vector<Models> models(1);
+      uint32_t prev1 = 0, prev2 = 0;
+      size_t pos = 0;
+      while (pos < n) {
+        const size_t chunk = std::min(n - pos, kChunkSize);
+        std::vector<uint8_t> payload;
+        enc.CompressChunk(data + pos, chunk, payload, models[0], prev1, prev2);
+        F2Encoder::WriteLeb(f2_data, payload.size());
+        f2_data.insert(f2_data.end(), payload.begin(), payload.end());
+        pos += chunk;
+      }
+    }
+    const uint64_t gate = uint64_t(cm_data.size()) * (1000 + kGatePermille) / 1000;
+    if (uint64_t(f2_data.size()) <= gate) {
+      out->write(f2_data.data(), f2_data.size());
+    } else {
+      std::vector<uint8_t> payload;
+      F2Encoder::WriteLeb(payload, n);
+      payload.push_back(kModeCM);
+      payload.push_back(cm_mem);
+      payload.insert(payload.end(), cm_data.begin(), cm_data.end());
+      std::vector<uint8_t> hdr;
+      F2Encoder::WriteLeb(hdr, payload.size());
+      out->write(hdr.data(), hdr.size());
+      out->write(payload.data(), payload.size());
     }
   }
 
@@ -993,7 +1002,7 @@ public:
       const uint8_t* peek = comp.data();
       const uint8_t* peek_end = comp.data() + payload;
       const size_t raw_len = F2Decoder::ReadLeb(peek, peek_end);
-      if (peek >= peek_end || raw_len > kChunkSize) return;
+      if (peek >= peek_end || raw_len > kSectionSize) return;
       if (raw_len > raw.size()) raw.resize(raw_len);
       size_t got = 0;
       if (*peek == kModeCM) {
