@@ -337,7 +337,16 @@ struct Models {
   // which is exactly the CM mixing advantage -- the planned P2b literal
   // blend (o1 + hashed-o2 with adaptive per-bucket weight) follows from this.
   static const uint32_t kPrev2Bits = 4;
-  NibModel tok[kTokKinds * kTokKinds];   // ctx: (prev kind, kind before that)
+  // ctx: (LZP candidate present at this position, prev kind, kind before
+  // that). The availability bit is known to both sides before the token nibble
+  // (the decoder probes the LZP table anyway for literals), and a verified o4
+  // candidate is a strong prior for LZP/MATCH over LIT.
+  NibModel tok[2 * kTokKinds * kTokKinds];
+
+  ALWAYS_INLINE static size_t TokCtx(bool avail, uint32_t prev_kind,
+                                     uint32_t prev_kind2) {
+    return (avail ? kTokKinds * kTokKinds : 0) + prev_kind * kTokKinds + prev_kind2;
+  }
   NibModel lit_hi[512u << kPrev2Bits];   // (prev|256+match_byte, prev2 bits)
   NibModel lit_lo[512 * 16];             // (prev|256+match_byte, hi)
   NibModel len_lo[5];                    // 0: match, 1: rep0, 2: rep1/2, 3: after-lit rep0, 4: lzp
@@ -568,9 +577,14 @@ public:
       dp[0].cost = 0;
       pred_.assign(span, kNoPred);
       pred_base_ = pos;
-      const NibModel& tokm = models.tok[prev_kind * kTokKinds + prev_kind2];
-      uint32_t tok_price[kTokKinds];
-      for (uint32_t k = 0; k < kTokKinds; ++k) tok_price[k] = CostNib(tokm, k);
+      // Two price rows from the span-entry models: availability varies per
+      // position (selected by pred_[i] in the scan), prev kinds are frozen at
+      // span entry like before.
+      uint32_t tok_price[2][kTokKinds];
+      for (uint32_t a = 0; a < 2; ++a) {
+        const NibModel& tokm = models.tok[Models::TokCtx(a != 0, prev_kind, prev_kind2)];
+        for (uint32_t k = 0; k < kTokKinds; ++k) tok_price[a][k] = CostNib(tokm, k);
+      }
       const size_t entry_reps[kNumReps] = {reps[0], reps[1], reps[2]};
 
       auto relax = [&](size_t j, uint32_t cost, uint32_t kind, size_t len, size_t dist) {
@@ -595,6 +609,7 @@ public:
         // what the decoder will recompute.
         const uint32_t lzp_cand = lzp_.Candidate(in, abs);
         pred_[i] = lzp_cand != kLzpNil ? in[lzp_cand] : kNoPred;
+        const uint32_t av = lzp_cand != kLzpNil ? 1 : 0;
         // Literal edge (exact bytes; the post-match fallback context is
         // approximated as absent while pricing).
         {
@@ -604,7 +619,7 @@ public:
           const uint32_t c0 = in[abs];
           const size_t primary = pred_[i] != kNoPred ? 256u + pred_[i] : (p1 & 0xFF);
           const size_t o3h = Models::O3Hash(p1, p2, p3);
-          const uint32_t lc = tok_price[kTokLit] +
+          const uint32_t lc = tok_price[av][kTokLit] +
             CostNibBlended(models.lit_hi[Models::LitHiCtx(primary, p2)],
                            models.blend_hi[o3h], models.bw_hi[o3h], c0 >> 4) +
             CostNibBlended(models.lit_lo[Models::LitLoCtx(primary, c0 >> 4)],
@@ -637,7 +652,7 @@ public:
           }
           const size_t lctx = r == 0 ? 1 : 2;
           for (size_t l = kMinRep; l <= len; ++l) {
-            relax(i + l, base_cost + tok_price[kTokRep0 + r] + kSpeedBias * 3 +
+            relax(i + l, base_cost + tok_price[av][kTokRep0 + r] + kSpeedBias * 3 +
                   LenCost(models, lctx, l, kMinRep), kTokRep0 + r, l, d);
           }
         }
@@ -661,7 +676,7 @@ public:
               }
             } else if (len >= kMinLzpLen) {
               for (size_t l = kMinLzpLen; l <= len; ++l) {
-                relax(i + l, base_cost + tok_price[kTokLzp] + kSpeedBias * 3 +
+                relax(i + l, base_cost + tok_price[av][kTokLzp] + kSpeedBias * 3 +
                       LenCost(models, 4, l, kMinLzpLen), kTokLzp, l, abs - cand);
               }
             }
@@ -683,7 +698,7 @@ public:
           } else if (mlen != 0) {
             const uint32_t dist_price = DistCost(models, mlen, dist);
             for (size_t l = kMinMatch; l <= mlen; ++l) {
-              relax(i + l, base_cost + tok_price[kTokMatch] + kSpeedBias * 5 +
+              relax(i + l, base_cost + tok_price[av][kTokMatch] + kSpeedBias * 5 +
                     LenCost(models, 0, l, kMinMatch) + dist_price, kTokMatch, l, dist);
             }
           }
@@ -760,31 +775,31 @@ public:
 
 private:
   ALWAYS_INLINE void EmitTok(Models& models, uint32_t& prev_kind, uint32_t& prev_kind2,
-                             uint32_t kind) {
-    enc_.PutNib(models.tok[prev_kind * kTokKinds + prev_kind2], kind);
+                             uint32_t kind, bool avail) {
+    enc_.PutNib(models.tok[Models::TokCtx(avail, prev_kind, prev_kind2)], kind);
     prev_kind2 = prev_kind;
     prev_kind = kind;
   }
 
+  // Predicted byte at pos (kNoPred if none), exactly as the decoder computes
+  // it. In-span positions read the scan-time snapshot; positions beyond the
+  // scanned span (a short rep crossing the span end got demoted to literals)
+  // have no entry, so catch the insert pointer up and query live -- at that
+  // moment the table state is exactly the decoder's (inserts [0, pos)). Using
+  // kNoPred there instead desynchronizes the contexts and corrupts the stream.
+  ALWAYS_INLINE uint32_t PredAt(const uint8_t* in, size_t pos) {
+    const size_t rel = pos - pred_base_;
+    if (rel < pred_.size()) return pred_[rel];
+    for (; lzp_ptr_ < pos; ++lzp_ptr_) lzp_.Insert(in, lzp_ptr_);
+    const uint32_t cand = lzp_.Candidate(in, pos);
+    return cand != kLzpNil ? in[cand] : kNoPred;
+  }
+
   ALWAYS_INLINE void EmitLit(Models& models, const uint8_t* in, size_t& pos,
                              const size_t* reps, uint32_t& prev1, uint32_t& prev2,
-                             uint32_t& prev3, bool& post_match) {
+                             uint32_t& prev3, bool& post_match, uint32_t pred) {
     const uint32_t c = in[pos];
     const uint32_t hi = c >> 4;
-    const size_t rel = pos - pred_base_;
-    uint32_t pred;
-    if (rel < pred_.size()) {
-      pred = pred_[rel];
-    } else {
-      // Beyond the scanned span (a short rep crossing the span end got demoted
-      // to literals): the snapshot has no entry, so query live. The scan's
-      // insert pointer is still below pos here, so after catching up the table
-      // state is exactly the decoder's (inserts [0, pos)) -- using kNoPred
-      // instead desynchronizes the literal context and corrupts the stream.
-      for (; lzp_ptr_ < pos; ++lzp_ptr_) lzp_.Insert(in, lzp_ptr_);
-      const uint32_t cand = lzp_.Candidate(in, pos);
-      pred = cand != kLzpNil ? in[cand] : kNoPred;
-    }
     size_t primary;
     if (pred != kNoPred) {
       primary = 256u + pred;
@@ -877,9 +892,11 @@ private:
                   std::vector<std::pair<size_t, size_t>>& seg_meta,
                   std::vector<uint8_t>& data) {
     (void)n;
+    const uint32_t pred0 = PredAt(in, pos);
+    const bool avail0 = pred0 != kNoPred;
     if (kind == kTokLit) {
-      EmitTok(models, prev_kind, prev_kind2, kTokLit);
-      EmitLit(models, in, pos, reps, prev1, prev2, prev3, post_match);
+      EmitTok(models, prev_kind, prev_kind2, kTokLit, avail0);
+      EmitLit(models, in, pos, reps, prev1, prev2, prev3, post_match, pred0);
     } else {
       if (kind >= kTokRep0 && kind <= kTokRep2) {
         size_t r_found = kNumReps;
@@ -892,8 +909,9 @@ private:
           kind = kTokMatch;
         } else {
           for (size_t k = 0; k < len; ++k) {
-            EmitTok(models, prev_kind, prev_kind2, kTokLit);
-            EmitLit(models, in, pos, reps, prev1, prev2, prev3, post_match);
+            const uint32_t p = k == 0 ? pred0 : PredAt(in, pos);
+            EmitTok(models, prev_kind, prev_kind2, kTokLit, p != kNoPred);
+            EmitLit(models, in, pos, reps, prev1, prev2, prev3, post_match, p);
             ++seg_tokens;
             if (seg_tokens == kSegTokens) FlushSegment(seg_meta, data, seg_tokens);
           }
@@ -901,20 +919,20 @@ private:
         }
       }
       if (kind == kTokMatch) {
-        EmitTok(models, prev_kind, prev_kind2, kTokMatch);
+        EmitTok(models, prev_kind, prev_kind2, kTokMatch, avail0);
         EncodeLen(enc_, models, 0, len, kMinMatch);
         EmitDist(models, len, dist);
         for (size_t r = kNumReps; r-- > 1;) reps[r] = reps[r - 1];
         reps[0] = dist;
       } else if (kind == kTokLzp) {
-        EmitTok(models, prev_kind, prev_kind2, kTokLzp);
+        EmitTok(models, prev_kind, prev_kind2, kTokLzp, avail0);
         EncodeLen(enc_, models, 4, len, kMinLzpLen);
         if (dist != reps[0]) {
           for (size_t r = kNumReps; r-- > 1;) reps[r] = reps[r - 1];
           reps[0] = dist;
         }
       } else {
-        EmitTok(models, prev_kind, prev_kind2, kind);
+        EmitTok(models, prev_kind, prev_kind2, kind, avail0);
         EncodeLen(enc_, models, Models::LenCtx(kind, prev_kind2), len, kMinRep);
         const size_t r_idx = kind - kTokRep0;
         const size_t d = reps[r_idx];
@@ -933,25 +951,6 @@ private:
     }
     ++seg_tokens;
     if (seg_tokens == kSegTokens) FlushSegment(seg_meta, data, seg_tokens);
-  }
-
-  ALWAYS_INLINE static uint32_t MatchCost(const Models& models, const NibModel& tokm,
-                                          size_t len, size_t dist, uint32_t prev_kind) {
-    const uint32_t slot = DistSlot(static_cast<uint32_t>(dist));
-    const size_t dctx = len >= 8 ? 1 : 0;
-    const uint32_t ebits = DistExtraBits(slot);
-    uint32_t cost = CostNib(tokm, kTokMatch) +
-      LenCost(models, 0, len, kMinMatch) +
-      CostNib(models.dist_hi[dctx], slot >> 4) +
-      CostNib(models.dist_lo[dctx][std::min<uint32_t>(slot >> 4, 3)], slot & 15);
-    if (ebits > 4) {
-      cost += (ebits - 4) * 16 +
-        CostNib(models.dist_align[dctx],
-                (static_cast<uint32_t>(dist) - DistBase(slot)) & 15);
-    } else {
-      cost += ebits * 16;
-    }
-    return cost;
   }
 
   void FlushSegment(std::vector<std::pair<size_t, size_t>>& seg_meta,
@@ -1018,10 +1017,11 @@ public:
       p += data_len;
       while (n_tokens-- != 0) {
         for (; lzp_ptr < pos; ++lzp_ptr) lzp_.Insert(out, lzp_ptr);
-        const size_t kind = dec_.GetNib(models.tok[prev_kind * kTokKinds + prev_kind2]);
+        const uint32_t lzp_cand = lzp_.Candidate(out, pos);
+        const size_t kind = dec_.GetNib(models.tok[Models::TokCtx(
+            lzp_cand != kLzpNil, prev_kind, prev_kind2)]);
         if (kind == kTokLit) {
           if (pos >= raw_len) return 0;
-          const uint32_t lzp_cand = lzp_.Candidate(out, pos);
           size_t primary;
           if (lzp_cand != kLzpNil) {
             primary = 256u + out[lzp_cand];
@@ -1068,7 +1068,7 @@ public:
             reps[0] = dist;
           } else if (kind == kTokLzp) {
             len = DecodeLen(dec_, models, 4, kMinLzpLen);
-            const uint32_t cand = lzp_.Candidate(out, pos);
+            const uint32_t cand = lzp_cand;
             if (cand == kLzpNil) return 0;  // corrupt: encoder had a candidate
             dist = pos - cand;
             if (dist != reps[0]) {
