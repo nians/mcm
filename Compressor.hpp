@@ -101,6 +101,7 @@ public:
     kTypeCMMax,
     kTypeCMSimple,
     kTypeDMC,
+    kTypeMCMF2,
   };
 
   class Factory {

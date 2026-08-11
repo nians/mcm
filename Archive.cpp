@@ -27,6 +27,7 @@
 #include <cstring>
 
 #include "CM-inl.hpp"
+#include "F2.hpp"
 #include "X86Binary.hpp"
 #include "Wav16.hpp"
 
@@ -98,6 +99,7 @@ Archive::Algorithm::Algorithm(const CompressionOptions& options, Detector::Profi
     case kCompLevelHigh: algorithm_ = Compressor::kTypeCMHigh; break;
     case kCompLevelMax: algorithm_ = Compressor::kTypeCMMax; break;
     case kCompLevelSimple: algorithm_ = Compressor::kTypeCMSimple; break;
+    case kCompLevelFast2: algorithm_ = Compressor::kTypeMCMF2; break;
     }
   }
   switch (profile) {
@@ -147,6 +149,7 @@ Compressor* Archive::Algorithm::CreateCompressor(const FrequencyCounter<256>& fr
   case Compressor::kTypeCMHigh: return new cm::CM<10, /*sse*/false>(freq, mem_usage_, lzp_enabled_, profile_);
   case Compressor::kTypeCMMax: return new cm::CM<13, /*sse*/true>(freq, mem_usage_, lzp_enabled_, profile_);
   case Compressor::kTypeCMSimple: return new cm::CM<6, false>(freq, mem_usage_, lzp_enabled_, Detector::kProfileSimple);
+  case Compressor::kTypeMCMF2: return new f2::F2;
   }
   return nullptr;
 }
@@ -192,6 +195,7 @@ std::ostream& operator<<(std::ostream& os, CompLevel comp_level) {
   case kCompLevelHigh: return os << "high";
   case kCompLevelMax: return os << "max";
   case kCompLevelSimple: return os << "simple";
+  case kCompLevelFast2: return os << "fast2";
   }
   return os << "unknown";
 }

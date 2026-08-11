@@ -49,6 +49,7 @@ enum CompLevel {
   kCompLevelHigh,
   kCompLevelMax,
   kCompLevelSimple,
+  kCompLevelFast2,
 };
 std::ostream& operator<<(std::ostream& os, CompLevel comp_level);
 

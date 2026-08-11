@@ -12,7 +12,7 @@ MCM=$(realpath "$1")
 CORPUS_DIR=$(realpath "$2")
 WORK=${3:-$(mktemp -d)}
 mkdir -p "$WORK"
-CONFIGS=("-t8" "-f8" "-m8" "-f6" "-f8 -filter=none" "-f8 -lzp=false")
+CONFIGS=("-t8" "-f8" "-m8" "-f6" "-f8 -filter=none" "-f8 -lzp=false" "-z8" "-z8 -filter=none")
 DECOMP_TIMEOUT=600
 fails=0
 total=0

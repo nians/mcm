@@ -180,6 +180,7 @@ public:
         else if (arg[1] == 'h') options_.comp_level_ = kCompLevelHigh;
         else if (arg[1] == 'x') options_.comp_level_ = kCompLevelMax;
         else if (arg[1] == 's') options_.comp_level_ = kCompLevelSimple;
+        else if (arg[1] == 'z') options_.comp_level_ = kCompLevelFast2;
         else {
           std::cerr << "Unknown option " << arg << std::endl;
           return 4;
