@@ -524,7 +524,6 @@ public:
     uint32_t prev1 = prev1_io, prev2 = prev2_io, prev3 = prev3_io;
     uint32_t prev_kind = kTokLit, prev_kind2 = kTokLit;
     bool post_match = false;
-    size_t miss_run = 0, next_search = 0;
     size_t seg_tokens = 0;
     enc_.Reset();
 
@@ -532,147 +531,164 @@ public:
     (void)cost_tab;
 
     size_t lzp_ptr = 0;
+    // ---- Optimal parse: price-frozen DP over short spans, then emission with
+    // live model updates. Prices are refreshed every span, so the staleness
+    // window is ~kOptSpan tokens; the DP itself never touches the models, so
+    // this is a pure encoder-side upgrade with zero decode cost.
+    static const size_t kOptSpan = 512;
+    static const size_t kFastLen = 64;  // candidates this long truncate the span
+    struct Par { uint32_t cost; uint32_t dist; uint16_t len; uint8_t kind; };
+    std::vector<Par> dp(kOptSpan + kFastLen + 1);
+    std::vector<Par> toks;
     while (pos < n) {
-      // Publish the positions consumed so far to the LZP table (decoder does
-      // exactly the same at the top of its token loop).
-      for (; lzp_ptr < pos; ++lzp_ptr) lzp_.Insert(in, lzp_ptr);
-      const size_t max_len = std::min(n - pos, kMaxMatchLen + kMinMatch);
-      // Candidate: best rep.
-      size_t best_rep_len = 0, best_rep = 0;
-      for (size_t r = 0; r < kNumReps; ++r) {
-        const size_t d = reps[r];
-        if (d > pos) continue;
-        const uint8_t* a = in + pos;
-        const uint8_t* b = a - d;
-        if (a[best_rep_len] != b[best_rep_len]) continue;
-        size_t len = 0;
-        while (len < max_len && a[len] == b[len]) ++len;
-        if (len > best_rep_len) {
-          best_rep_len = len;
-          best_rep = r;
-        }
-      }
-      if (best_rep_len < kMinRep) best_rep_len = 0;
-      // Candidate: content-addressed LZP (length-only coding).
-      size_t lzp_len = 0, lzp_dist = 0;
-      const uint32_t lzp_cand = lzp_.Candidate(in, pos);
-      if (lzp_cand != kLzpNil) {
-        const uint8_t* a = in + pos;
-        const uint8_t* b = in + lzp_cand;
-        size_t len = 0;
-        while (len < max_len && a[len] == b[len]) ++len;
-        if (len >= kMinLzpLen) {
-          lzp_len = len;
-          lzp_dist = pos - lzp_cand;
-        }
-      }
-      // Candidate: explicit match (throttled; a long rep/lzp wins regardless).
-      size_t dist = 0, mlen = 0;
-      if (best_rep_len < 32 && lzp_len < 32 && pos >= next_search) {
-        mlen = mf_.Find(pos, max_len, &dist);
-        if (mlen == 0) next_search = pos + 1 + (miss_run >> 6);
-      }
-
-      // Costs (1/16 bit units) against the current models.
+      const size_t span = std::min(n - pos, kOptSpan);
+      const size_t dp_cap = std::min(n - pos, kOptSpan + kFastLen);
+      for (size_t j = 0; j <= dp_cap; ++j) dp[j].cost = 0xFFFFFFFFu;
+      dp[0].cost = 0;
       const NibModel& tokm = models.tok[prev_kind * kTokKinds + prev_kind2];
-      const uint32_t match_byte = post_match ? in[pos - reps[0]] : 0;
-      const size_t lit_primary = Models::LitPrimary(prev1, post_match, match_byte);
-      const uint32_t c0 = in[pos];
-      const size_t o3h = Models::O3Hash(prev1, prev2, prev3);
-      const uint32_t lit_cost = CostNib(tokm, kTokLit) +
-        CostNibBlended(models.lit_hi[Models::LitHiCtx(lit_primary, prev2)],
-                       models.blend_hi[o3h], models.bw_hi[o3h], c0 >> 4) +
-        CostNibBlended(models.lit_lo[Models::LitLoCtx(lit_primary, c0 >> 4)],
-                       models.blend_lo[Models::LoBucket(o3h, c0 >> 4)],
-                       models.bw_lo[Models::LoBucket(o3h, c0 >> 4)], c0 & 15);
+      uint32_t tok_price[kTokKinds];
+      for (uint32_t k = 0; k < kTokKinds; ++k) tok_price[k] = CostNib(tokm, k);
+      const size_t entry_reps[kNumReps] = {reps[0], reps[1], reps[2]};
 
-      uint32_t rep_avg = ~0u;
-      if (best_rep_len != 0) {
-        const uint32_t kind = static_cast<uint32_t>(kTokRep0 + best_rep);
-        const uint32_t cost = CostNib(tokm, kind) +
-          LenCost(models, Models::LenCtx(kind, prev_kind), best_rep_len, kMinRep);
-        rep_avg = cost / static_cast<uint32_t>(best_rep_len);
-      }
-      uint32_t lzp_avg = ~0u;
-      if (lzp_len != 0) {
-        const uint32_t cost = CostNib(tokm, kTokLzp) +
-          LenCost(models, 4, lzp_len, kMinLzpLen);
-        lzp_avg = cost / static_cast<uint32_t>(lzp_len);
-      }
-      uint32_t match_avg = ~0u;
-      if (mlen != 0) {
-        match_avg = MatchCost(models, tokm, mlen, dist, prev_kind) /
-          static_cast<uint32_t>(mlen);
-      }
+      auto relax = [&](size_t j, uint32_t cost, uint32_t kind, size_t len, size_t dist) {
+        if (cost < dp[j].cost) {
+          dp[j] = Par{cost, static_cast<uint32_t>(dist), static_cast<uint16_t>(len),
+                      static_cast<uint8_t>(kind)};
+        }
+      };
 
-      const bool lzp_beats_rep = lzp_avg <= rep_avg;
-      const uint32_t back_avg = lzp_beats_rep ? lzp_avg : rep_avg;
-      const bool rep_beats_match = back_avg <= match_avg;
-      const uint32_t seq_avg = rep_beats_match ? back_avg : match_avg;
-      if (seq_avg >= lit_cost) {
-        // Nothing beats coding one literal.
-        mf_.Insert(pos);
-        EmitTok(models, prev_kind, prev_kind2, kTokLit);
-        EmitLit(models, in, pos, reps, prev1, prev2, prev3, post_match);
-        ++seg_tokens;
-        ++miss_run;
-        if (seg_tokens == kSegTokens) FlushSegment(seg_meta, data, seg_tokens);
-        continue;
-      }
-      miss_run = 0;
-      if (!rep_beats_match) {
-        // One-step lazy: a longer match at pos+1 can beat this one.
-        mf_.Insert(pos);
-        if (mlen < 32 && pos + 1 < n) {
-          size_t d2 = 0;
-          const size_t l2 =
-            mf_.Find(pos + 1, std::min(n - pos - 1, kMaxMatchLen + kMinMatch), &d2);
-          if (l2 > mlen) {
-            const uint32_t next_cost = MatchCost(models, tokm, l2, d2, kTokLit);
-            if ((lit_cost + next_cost) / static_cast<uint32_t>(1 + l2) <= match_avg) {
-              EmitTok(models, prev_kind, prev_kind2, kTokLit);
-              EmitLit(models, in, pos, reps, prev1, prev2, prev3, post_match);
-              ++seg_tokens;
-              if (seg_tokens == kSegTokens) FlushSegment(seg_meta, data, seg_tokens);
-              continue;
+      size_t scan_end = span;
+      size_t brk_kind = 0, brk_len = 0, brk_dist = 0;
+      bool has_break = false;
+      for (size_t i = 0; i < span && !has_break; ++i) {
+        const size_t abs = pos + i;
+        for (; lzp_ptr < abs; ++lzp_ptr) lzp_.Insert(in, lzp_ptr);
+        const uint32_t base_cost = dp[i].cost;
+        const size_t cand_cap = std::min(n - abs, kMaxMatchLen + kMinMatch);
+
+        // Literal edge (exact bytes; the post-match literal context is
+        // approximated as absent while pricing).
+        {
+          const uint32_t p1 = abs >= 1 ? in[abs - 1] : (i == 0 ? prev1 : 0);
+          const uint32_t p2 = abs >= 2 ? in[abs - 2] : (i == 0 ? prev2 : 0);
+          const uint32_t p3 = abs >= 3 ? in[abs - 3] : (i == 0 ? prev3 : 0);
+          const uint32_t c0 = in[abs];
+          const size_t o3h = Models::O3Hash(p1, p2, p3);
+          const uint32_t lc = tok_price[kTokLit] +
+            CostNibBlended(models.lit_hi[Models::LitHiCtx(p1 & 0xFF, p2)],
+                           models.blend_hi[o3h], models.bw_hi[o3h], c0 >> 4) +
+            CostNibBlended(models.lit_lo[Models::LitLoCtx(p1 & 0xFF, c0 >> 4)],
+                           models.blend_lo[Models::LoBucket(o3h, c0 >> 4)],
+                           models.bw_lo[Models::LoBucket(o3h, c0 >> 4)], c0 & 15);
+          relax(i + 1, base_cost + lc, kTokLit, 1, 0);
+        }
+        // Rep candidates against the span-entry rep list; emission re-maps or
+        // falls back to an explicit match if the live list drifted, so the
+        // recorded distance is always what the bytes were verified against.
+        for (size_t r = 0; r < kNumReps; ++r) {
+          const size_t d = entry_reps[r];
+          if (d > abs) continue;
+          const uint8_t* a = in + abs;
+          const uint8_t* b = a - d;
+          if (a[0] != b[0]) continue;
+          size_t len = 1;
+          const size_t cap = std::min(cand_cap, kFastLen);
+          while (len < cap && a[len] == b[len]) ++len;
+          if (len >= kFastLen) {
+            while (len < cand_cap && a[len] == b[len]) ++len;
+            if (!has_break || len > brk_len) {
+              has_break = true;
+              brk_kind = kTokRep0 + r;
+              brk_len = len;
+              brk_dist = d;
+              scan_end = i;
+            }
+            continue;
+          }
+          const size_t lctx = r == 0 ? 1 : 2;
+          for (size_t l = kMinRep; l <= len; ++l) {
+            relax(i + l, base_cost + tok_price[kTokRep0 + r] +
+                  LenCost(models, lctx, l, kMinRep), kTokRep0 + r, l, d);
+          }
+        }
+        // LZP candidate (table state is position-driven, so the distance the
+        // decoder will recompute at this position is exactly this one).
+        {
+          const uint32_t cand = lzp_.Candidate(in, abs);
+          if (cand != kLzpNil) {
+            const uint8_t* a = in + abs;
+            const uint8_t* b = in + cand;
+            size_t len = 0;
+            const size_t cap = std::min(cand_cap, kFastLen);
+            while (len < cap && a[len] == b[len]) ++len;
+            if (len >= kFastLen) {
+              while (len < cand_cap && a[len] == b[len]) ++len;
+              if (!has_break || len > brk_len) {
+                has_break = true;
+                brk_kind = kTokLzp;
+                brk_len = len;
+                brk_dist = abs - cand;
+                scan_end = i;
+              }
+            } else if (len >= kMinLzpLen) {
+              for (size_t l = kMinLzpLen; l <= len; ++l) {
+                relax(i + l, base_cost + tok_price[kTokLzp] +
+                      LenCost(models, 4, l, kMinLzpLen), kTokLzp, l, abs - cand);
+              }
             }
           }
         }
-        InsertSpan(pos + 1, mlen - 1);
-        EmitTok(models, prev_kind, prev_kind2, kTokMatch);
-        EncodeLen(enc_, models, 0, mlen, kMinMatch);
-        EmitDist(models, mlen, dist);
-        for (size_t r = kNumReps; r-- > 1;) reps[r] = reps[r - 1];
-        reps[0] = dist;
-        pos += mlen;
-      } else if (lzp_beats_rep) {
-        mf_.Insert(pos);
-        InsertSpan(pos + 1, lzp_len - 1);
-        EmitTok(models, prev_kind, prev_kind2, kTokLzp);
-        EncodeLen(enc_, models, 4, lzp_len, kMinLzpLen);
-        if (lzp_dist != reps[0]) {
-          for (size_t r = kNumReps; r-- > 1;) reps[r] = reps[r - 1];
-          reps[0] = lzp_dist;
+        // Explicit match: one (longest, nearest) candidate, all sub-lengths.
+        {
+          size_t dist = 0;
+          const size_t mlen = mf_.Find(abs, cand_cap, &dist);
+          mf_.Insert(abs);
+          if (mlen >= kFastLen) {
+            if (!has_break || mlen > brk_len) {
+              has_break = true;
+              brk_kind = kTokMatch;
+              brk_len = mlen;
+              brk_dist = dist;
+              scan_end = i;
+            }
+          } else if (mlen != 0) {
+            const uint32_t dist_price = DistCost(models, mlen, dist);
+            for (size_t l = kMinMatch; l <= mlen; ++l) {
+              relax(i + l, base_cost + tok_price[kTokMatch] +
+                    LenCost(models, 0, l, kMinMatch) + dist_price, kTokMatch, l, dist);
+            }
+          }
         }
-        pos += lzp_len;
-      } else {
-        mf_.Insert(pos);
-        InsertSpan(pos + 1, best_rep_len - 1);
-        const uint32_t kind = static_cast<uint32_t>(kTokRep0 + best_rep);
-        EmitTok(models, prev_kind, prev_kind2, kind);
-        EncodeLen(enc_, models, Models::LenCtx(kind, prev_kind2),
-                  best_rep_len, kMinRep);
-        const size_t d = reps[best_rep];
-        for (size_t r = best_rep; r > 0; --r) reps[r] = reps[r - 1];
-        reps[0] = d;
-        pos += best_rep_len;
       }
-      prev1 = in[pos - 1];
-      prev2 = pos >= 2 ? in[pos - 2] : prev1;
-      prev3 = pos >= 3 ? in[pos - 3] : prev2;
-      post_match = true;
-      ++seg_tokens;
-      if (seg_tokens == kSegTokens) FlushSegment(seg_meta, data, seg_tokens);
+
+      // Choose the end node and backtrack the token list.
+      size_t end_j;
+      if (has_break) {
+        end_j = scan_end;
+      } else {
+        end_j = span;
+        for (size_t j = span; j <= dp_cap; ++j) {
+          if (dp[j].cost < dp[end_j].cost) end_j = j;
+        }
+      }
+      toks.clear();
+      for (size_t j = end_j; j > 0;) {
+        toks.push_back(dp[j]);
+        j -= dp[j].len;
+      }
+
+      // Emit backwards-collected tokens forward, with live model updates.
+      for (size_t t = toks.size(); t-- > 0;) {
+        EmitParsed(models, in, n, toks[t].kind, toks[t].len, toks[t].dist,
+                   pos, reps, prev1, prev2, prev3, post_match,
+                   prev_kind, prev_kind2, seg_tokens, seg_meta, data);
+      }
+      if (has_break) {
+        InsertSpan(pos + 1, brk_len - 1);
+        EmitParsed(models, in, n, static_cast<uint32_t>(brk_kind), brk_len, brk_dist,
+                   pos, reps, prev1, prev2, prev3, post_match,
+                   prev_kind, prev_kind2, seg_tokens, seg_meta, data);
+      }
     }
     if (seg_tokens != 0) FlushSegment(seg_meta, data, seg_tokens);
 
@@ -778,6 +794,89 @@ private:
         CostNib(models.len_mid_lo[lctx][mid >> 4], mid & 15);
     }
     return CostNib(m, kLenBypass16) + 16 * 16;
+  }
+
+  ALWAYS_INLINE static uint32_t DistCost(const Models& models, size_t len, size_t dist) {
+    const uint32_t slot = DistSlot(static_cast<uint32_t>(dist));
+    const size_t dctx = len >= 8 ? 1 : 0;
+    const uint32_t ebits = DistExtraBits(slot);
+    uint32_t cost = CostNib(models.dist_hi[dctx], slot >> 4) +
+      CostNib(models.dist_lo[dctx][std::min<uint32_t>(slot >> 4, 3)], slot & 15);
+    if (ebits > 4) {
+      cost += (ebits - 4) * 16 +
+        CostNib(models.dist_align[dctx],
+                (static_cast<uint32_t>(dist) - DistBase(slot)) & 15);
+    } else {
+      cost += ebits * 16;
+    }
+    return cost;
+  }
+
+  // Emission for DP-parsed tokens. Rep tokens re-map against the live rep list
+  // (the DP priced them against the span-entry list); if the distance is no
+  // longer on the list it degrades to an explicit match, and a too-short rep
+  // degrades to literals -- the recorded distance is what the bytes were
+  // verified against, so every degradation stays byte-exact.
+  void EmitParsed(Models& models, const uint8_t* in, size_t n, uint32_t kind,
+                  size_t len, size_t dist, size_t& pos, size_t* reps,
+                  uint32_t& prev1, uint32_t& prev2, uint32_t& prev3,
+                  bool& post_match, uint32_t& prev_kind, uint32_t& prev_kind2,
+                  size_t& seg_tokens,
+                  std::vector<std::pair<size_t, size_t>>& seg_meta,
+                  std::vector<uint8_t>& data) {
+    (void)n;
+    if (kind == kTokLit) {
+      EmitTok(models, prev_kind, prev_kind2, kTokLit);
+      EmitLit(models, in, pos, reps, prev1, prev2, prev3, post_match);
+    } else {
+      if (kind >= kTokRep0 && kind <= kTokRep2) {
+        size_t r_found = kNumReps;
+        for (size_t r = 0; r < kNumReps; ++r) {
+          if (reps[r] == dist) { r_found = r; break; }
+        }
+        if (r_found < kNumReps) {
+          kind = static_cast<uint32_t>(kTokRep0 + r_found);
+        } else if (len >= kMinMatch) {
+          kind = kTokMatch;
+        } else {
+          for (size_t k = 0; k < len; ++k) {
+            EmitTok(models, prev_kind, prev_kind2, kTokLit);
+            EmitLit(models, in, pos, reps, prev1, prev2, prev3, post_match);
+            ++seg_tokens;
+            if (seg_tokens == kSegTokens) FlushSegment(seg_meta, data, seg_tokens);
+          }
+          return;
+        }
+      }
+      if (kind == kTokMatch) {
+        EmitTok(models, prev_kind, prev_kind2, kTokMatch);
+        EncodeLen(enc_, models, 0, len, kMinMatch);
+        EmitDist(models, len, dist);
+        for (size_t r = kNumReps; r-- > 1;) reps[r] = reps[r - 1];
+        reps[0] = dist;
+      } else if (kind == kTokLzp) {
+        EmitTok(models, prev_kind, prev_kind2, kTokLzp);
+        EncodeLen(enc_, models, 4, len, kMinLzpLen);
+        if (dist != reps[0]) {
+          for (size_t r = kNumReps; r-- > 1;) reps[r] = reps[r - 1];
+          reps[0] = dist;
+        }
+      } else {
+        EmitTok(models, prev_kind, prev_kind2, kind);
+        EncodeLen(enc_, models, Models::LenCtx(kind, prev_kind2), len, kMinRep);
+        const size_t r_idx = kind - kTokRep0;
+        const size_t d = reps[r_idx];
+        for (size_t r = r_idx; r > 0; --r) reps[r] = reps[r - 1];
+        reps[0] = d;
+      }
+      pos += len;
+      prev1 = in[pos - 1];
+      prev2 = pos >= 2 ? in[pos - 2] : prev1;
+      prev3 = pos >= 3 ? in[pos - 3] : prev2;
+      post_match = true;
+    }
+    ++seg_tokens;
+    if (seg_tokens == kSegTokens) FlushSegment(seg_meta, data, seg_tokens);
   }
 
   ALWAYS_INLINE static uint32_t MatchCost(const Models& models, const NibModel& tokm,
