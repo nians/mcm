@@ -6,3 +6,4 @@ mcm_fix
 *.o
 of.txt
 *.mcm
+mcm_pgo
