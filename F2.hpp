@@ -54,7 +54,50 @@ static const size_t kNumReps = 3;
 // Token kinds (symbols of the token model).
 enum TokKind {
   kTokLit = 0, kTokMatch = 1, kTokRep0 = 2, kTokRep1 = 3, kTokRep2 = 4,
-  kTokKinds = 5,
+  kTokLzp = 5,
+  kTokKinds = 6,
+};
+
+// LZP layer: both sides maintain "last position whose preceding 4 bytes hashed
+// here" and verify the actual context bytes, so a hash collision simply means
+// no candidate on either side. A hit is content-addressed -- only the length
+// is coded, no distance -- which is where the CM fast mode gets most of its
+// win on redundant data (study section P2b).
+static const uint32_t kLzpBits = 18;
+static const size_t kMinLzpLen = 2;
+static const uint32_t kLzpNil = 0xFFFFFFFFu;
+
+class LzpTable {
+public:
+  // Order-4 context. Order-6 was measured slightly worse across every corpus:
+  // in an LZ frame the rep list and explicit matches already cover most of
+  // what higher-order LZP would add.
+  void Reset() { table_.assign(size_t(1) << kLzpBits, kLzpNil); }
+
+  // Candidate for position pos given the buffer decoded so far, or kLzpNil.
+  ALWAYS_INLINE uint32_t Candidate(const uint8_t* buf, size_t pos) const {
+    if (pos < 4) return kLzpNil;
+    const uint32_t c = table_[Hash(buf, pos)];
+    if (c == kLzpNil) return kLzpNil;
+    // Verify the context so both sides agree on collision misses.
+    uint32_t a, b;
+    memcpy(&a, buf + pos - 4, 4);
+    memcpy(&b, buf + c - 4, 4);
+    return a == b ? c : kLzpNil;
+  }
+
+  ALWAYS_INLINE void Insert(const uint8_t* buf, size_t pos) {
+    if (pos >= 4) table_[Hash(buf, pos)] = static_cast<uint32_t>(pos);
+  }
+
+private:
+  ALWAYS_INLINE static uint32_t Hash(const uint8_t* buf, size_t pos) {
+    uint32_t v;
+    memcpy(&v, buf + pos - 4, 4);
+    return (v * 2654435761u) >> (32 - kLzpBits);
+  }
+
+  std::vector<uint32_t> table_;
 };
 
 // ---------------------------------------------------------------------------
@@ -213,7 +256,9 @@ struct Models {
   NibModel tok[kTokKinds * kTokKinds];   // ctx: (prev kind, kind before that)
   NibModel lit_hi[512 * 16];             // (prev|256+match_byte, prev2 >> 4)
   NibModel lit_lo[512 * 16];             // (prev|256+match_byte, hi)
-  NibModel len_lo[4];                    // 0: match, 1: rep0, 2: rep1/2, 3: after-lit rep0
+  NibModel len_lo[5];                    // 0: match, 1: rep0, 2: rep1/2, 3: after-lit rep0, 4: lzp
+  NibModel len_mid_hi[5];                // slot-14 lengths: value/16 (0..3)
+  NibModel len_mid_lo[5][4];             // slot-14 lengths: value%16
   NibModel dist_hi[2];                   // ctx: len >= 8
   NibModel dist_lo[2][4];                // ctx: (len >= 8, hi)
   NibModel dist_align[2];                // low 4 bits of large distances
@@ -223,6 +268,7 @@ struct Models {
   }
   ALWAYS_INLINE static size_t LenCtx(uint32_t kind, uint32_t prev_kind) {
     if (kind == kTokMatch) return 0;
+    if (kind == kTokLzp) return 4;
     if (kind == kTokRep0) return prev_kind == kTokLit ? 3 : 1;
     return 2;
   }
@@ -315,7 +361,7 @@ private:
     return (v * 2654435761u) >> (32 - kHashBits);
   }
 
-  static const uint32_t kNil = 0xFFFFFFFFu;
+  enum : uint32_t { kNil = 0xFFFFFFFFu };
   const uint8_t* data_ = nullptr;
   size_t n_ = 0;
   std::vector<uint32_t> head_;
@@ -323,25 +369,35 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Length coding helpers (slot + optional raw bits).
+// Length coding helpers: 0..13 direct in the slot nibble, 14..77 through two
+// modeled nibbles (lengths cluster hard, raw bits waste ~3 of the 6), the
+// long tail through 16 raw bits.
 template <typename Sink>
-ALWAYS_INLINE void EncodeLen(Sink& enc, NibModel& m, size_t len, size_t min_len) {
+ALWAYS_INLINE void EncodeLen(Sink& enc, Models& models, size_t lctx, size_t len,
+                             size_t min_len) {
   const size_t v = len - min_len;
   if (v <= kMaxLenDirect) {
-    enc.PutNib(m, v);
+    enc.PutNib(models.len_lo[lctx], v);
   } else if (v <= kMaxLenDirect + 1 + 63) {
-    enc.PutNib(m, kLenBypass6);
-    enc.PutBits(static_cast<uint32_t>(v - (kMaxLenDirect + 1)), 6);
+    enc.PutNib(models.len_lo[lctx], kLenBypass6);
+    const uint32_t m = static_cast<uint32_t>(v - (kMaxLenDirect + 1));
+    enc.PutNib(models.len_mid_hi[lctx], m >> 4);
+    enc.PutNib(models.len_mid_lo[lctx][m >> 4], m & 15);
   } else {
-    enc.PutNib(m, kLenBypass16);
+    enc.PutNib(models.len_lo[lctx], kLenBypass16);
     enc.PutBits(static_cast<uint32_t>(v - (kMaxLenDirect + 1 + 64)), 16);
   }
 }
 
-ALWAYS_INLINE size_t DecodeLen(SegmentDecoder& dec, NibModel& m, size_t min_len) {
-  const size_t slot = dec.GetNib(m);
+ALWAYS_INLINE size_t DecodeLen(SegmentDecoder& dec, Models& models, size_t lctx,
+                               size_t min_len) {
+  const size_t slot = dec.GetNib(models.len_lo[lctx]);
   if (slot <= kMaxLenDirect) return min_len + slot;
-  if (slot == kLenBypass6) return min_len + kMaxLenDirect + 1 + dec.GetBits(6);
+  if (slot == kLenBypass6) {
+    const size_t hi = dec.GetNib(models.len_mid_hi[lctx]) & 3;
+    const size_t lo = dec.GetNib(models.len_mid_lo[lctx][hi]);
+    return min_len + kMaxLenDirect + 1 + ((hi << 4) | lo);
+  }
   return min_len + kMaxLenDirect + 1 + 64 + dec.GetBits(16);
 }
 
@@ -356,6 +412,7 @@ public:
   void CompressChunk(const uint8_t* in, size_t n, std::vector<uint8_t>& out,
                      Models& models, uint32_t& prev1_io, uint32_t& prev2_io) {
     mf_.Reset(in, n);
+    lzp_.Reset();
     // The raw-store escape below must also discard this chunk's model updates,
     // or the decoder (which skips a stored chunk entirely) falls out of sync.
     models_backup_.resize(1);
@@ -375,7 +432,11 @@ public:
     const uint16_t* cost_tab = CostTable();
     (void)cost_tab;
 
+    size_t lzp_ptr = 0;
     while (pos < n) {
+      // Publish the positions consumed so far to the LZP table (decoder does
+      // exactly the same at the top of its token loop).
+      for (; lzp_ptr < pos; ++lzp_ptr) lzp_.Insert(in, lzp_ptr);
       const size_t max_len = std::min(n - pos, kMaxMatchLen + kMinMatch);
       // Candidate: best rep.
       size_t best_rep_len = 0, best_rep = 0;
@@ -393,9 +454,22 @@ public:
         }
       }
       if (best_rep_len < kMinRep) best_rep_len = 0;
-      // Candidate: explicit match (throttled; a long rep wins regardless).
+      // Candidate: content-addressed LZP (length-only coding).
+      size_t lzp_len = 0, lzp_dist = 0;
+      const uint32_t lzp_cand = lzp_.Candidate(in, pos);
+      if (lzp_cand != kLzpNil) {
+        const uint8_t* a = in + pos;
+        const uint8_t* b = in + lzp_cand;
+        size_t len = 0;
+        while (len < max_len && a[len] == b[len]) ++len;
+        if (len >= kMinLzpLen) {
+          lzp_len = len;
+          lzp_dist = pos - lzp_cand;
+        }
+      }
+      // Candidate: explicit match (throttled; a long rep/lzp wins regardless).
       size_t dist = 0, mlen = 0;
-      if (best_rep_len < 32 && pos >= next_search) {
+      if (best_rep_len < 32 && lzp_len < 32 && pos >= next_search) {
         mlen = mf_.Find(pos, max_len, &dist);
         if (mlen == 0) next_search = pos + 1 + (miss_run >> 6);
       }
@@ -413,8 +487,14 @@ public:
       if (best_rep_len != 0) {
         const uint32_t kind = static_cast<uint32_t>(kTokRep0 + best_rep);
         const uint32_t cost = CostNib(tokm, kind) +
-          LenCost(models.len_lo[Models::LenCtx(kind, prev_kind)], best_rep_len, kMinRep);
+          LenCost(models, Models::LenCtx(kind, prev_kind), best_rep_len, kMinRep);
         rep_avg = cost / static_cast<uint32_t>(best_rep_len);
+      }
+      uint32_t lzp_avg = ~0u;
+      if (lzp_len != 0) {
+        const uint32_t cost = CostNib(tokm, kTokLzp) +
+          LenCost(models, 4, lzp_len, kMinLzpLen);
+        lzp_avg = cost / static_cast<uint32_t>(lzp_len);
       }
       uint32_t match_avg = ~0u;
       if (mlen != 0) {
@@ -422,8 +502,10 @@ public:
           static_cast<uint32_t>(mlen);
       }
 
-      const bool rep_beats_match = rep_avg <= match_avg;
-      const uint32_t seq_avg = rep_beats_match ? rep_avg : match_avg;
+      const bool lzp_beats_rep = lzp_avg <= rep_avg;
+      const uint32_t back_avg = lzp_beats_rep ? lzp_avg : rep_avg;
+      const bool rep_beats_match = back_avg <= match_avg;
+      const uint32_t seq_avg = rep_beats_match ? back_avg : match_avg;
       if (seq_avg >= lit_cost) {
         // Nothing beats coding one literal.
         mf_.Insert(pos);
@@ -455,17 +537,27 @@ public:
         }
         InsertSpan(pos + 1, mlen - 1);
         EmitTok(models, prev_kind, prev_kind2, kTokMatch);
-        EncodeLen(enc_, models.len_lo[0], mlen, kMinMatch);
+        EncodeLen(enc_, models, 0, mlen, kMinMatch);
         EmitDist(models, mlen, dist);
         for (size_t r = kNumReps; r-- > 1;) reps[r] = reps[r - 1];
         reps[0] = dist;
         pos += mlen;
+      } else if (lzp_beats_rep) {
+        mf_.Insert(pos);
+        InsertSpan(pos + 1, lzp_len - 1);
+        EmitTok(models, prev_kind, prev_kind2, kTokLzp);
+        EncodeLen(enc_, models, 4, lzp_len, kMinLzpLen);
+        if (lzp_dist != reps[0]) {
+          for (size_t r = kNumReps; r-- > 1;) reps[r] = reps[r - 1];
+          reps[0] = lzp_dist;
+        }
+        pos += lzp_len;
       } else {
         mf_.Insert(pos);
         InsertSpan(pos + 1, best_rep_len - 1);
         const uint32_t kind = static_cast<uint32_t>(kTokRep0 + best_rep);
         EmitTok(models, prev_kind, prev_kind2, kind);
-        EncodeLen(enc_, models.len_lo[Models::LenCtx(kind, prev_kind2)],
+        EncodeLen(enc_, models, Models::LenCtx(kind, prev_kind2),
                   best_rep_len, kMinRep);
         const size_t d = reps[best_rep];
         for (size_t r = best_rep; r > 0; --r) reps[r] = reps[r - 1];
@@ -553,10 +645,17 @@ private:
     }
   }
 
-  ALWAYS_INLINE static uint32_t LenCost(const NibModel& m, size_t len, size_t min_len) {
+  ALWAYS_INLINE static uint32_t LenCost(const Models& models, size_t lctx,
+                                        size_t len, size_t min_len) {
+    const NibModel& m = models.len_lo[lctx];
     const size_t v = len - min_len;
     if (v <= kMaxLenDirect) return CostNib(m, v);
-    if (v <= kMaxLenDirect + 1 + 63) return CostNib(m, kLenBypass6) + 6 * 16;
+    if (v <= kMaxLenDirect + 1 + 63) {
+      const uint32_t mid = static_cast<uint32_t>(v - (kMaxLenDirect + 1));
+      return CostNib(m, kLenBypass6) +
+        CostNib(models.len_mid_hi[lctx], mid >> 4) +
+        CostNib(models.len_mid_lo[lctx][mid >> 4], mid & 15);
+    }
     return CostNib(m, kLenBypass16) + 16 * 16;
   }
 
@@ -566,7 +665,7 @@ private:
     const size_t dctx = len >= 8 ? 1 : 0;
     const uint32_t ebits = DistExtraBits(slot);
     uint32_t cost = CostNib(tokm, kTokMatch) +
-      LenCost(models.len_lo[0], len, kMinMatch) +
+      LenCost(models, 0, len, kMinMatch) +
       CostNib(models.dist_hi[dctx], slot >> 4) +
       CostNib(models.dist_lo[dctx][std::min<uint32_t>(slot >> 4, 3)], slot & 15);
     if (ebits > 4) {
@@ -599,6 +698,7 @@ private:
 
   ChainMatchFinder mf_;
   SegmentEncoder enc_;
+  LzpTable lzp_;
   std::vector<Models> models_backup_;
 };
 
@@ -623,6 +723,8 @@ public:
       return raw_len;
     }
     const size_t n_segments = ReadLeb(p, in_end);
+    lzp_.Reset();
+    size_t lzp_ptr = 0;
     size_t pos = 0;
     size_t reps[kNumReps] = {1, 2, 3};
     uint32_t prev1 = prev1_io, prev2 = prev2_io;
@@ -635,6 +737,7 @@ public:
       dec_.Init(p, data_len);
       p += data_len;
       while (n_tokens-- != 0) {
+        for (; lzp_ptr < pos; ++lzp_ptr) lzp_.Insert(out, lzp_ptr);
         const size_t kind = dec_.GetNib(models.tok[prev_kind * kTokKinds + prev_kind2]);
         if (kind == kTokLit) {
           if (pos >= raw_len) return 0;
@@ -650,7 +753,7 @@ public:
         } else if (kind < kTokKinds) {
           size_t len, dist;
           if (kind == kTokMatch) {
-            len = DecodeLen(dec_, models.len_lo[0], kMinMatch);
+            len = DecodeLen(dec_, models, 0, kMinMatch);
             const size_t dctx = len >= 8 ? 1 : 0;
             const uint32_t hi = static_cast<uint32_t>(dec_.GetNib(models.dist_hi[dctx]));
             const uint32_t lo = static_cast<uint32_t>(
@@ -666,9 +769,18 @@ public:
             }
             for (size_t r = kNumReps; r-- > 1;) reps[r] = reps[r - 1];
             reps[0] = dist;
+          } else if (kind == kTokLzp) {
+            len = DecodeLen(dec_, models, 4, kMinLzpLen);
+            const uint32_t cand = lzp_.Candidate(out, pos);
+            if (cand == kLzpNil) return 0;  // corrupt: encoder had a candidate
+            dist = pos - cand;
+            if (dist != reps[0]) {
+              for (size_t r = kNumReps; r-- > 1;) reps[r] = reps[r - 1];
+              reps[0] = dist;
+            }
           } else {
-            len = DecodeLen(dec_, models.len_lo[Models::LenCtx(
-              static_cast<uint32_t>(kind), prev_kind)], kMinRep);
+            len = DecodeLen(dec_, models, Models::LenCtx(
+              static_cast<uint32_t>(kind), prev_kind), kMinRep);
             const size_t r_idx = kind - kTokRep0;
             dist = reps[r_idx];
             for (size_t r = r_idx; r > 0; --r) reps[r] = reps[r - 1];
@@ -719,6 +831,7 @@ private:
   }
 
   SegmentDecoder dec_;
+  LzpTable lzp_;
 };
 
 // ---------------------------------------------------------------------------
