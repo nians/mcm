@@ -253,8 +253,15 @@ private:
 // nibble of the byte before that; the low nibble sees the same primary byte
 // plus the decoded high nibble.
 struct Models {
+  // Width of the second-order literal context (bits of prev2 seen by the
+  // high-nibble model). Full order-2 (8 bits) measured WORSE on every corpus:
+  // 131K unmixed contexts see ~40 samples each and never warm up. Sparse
+  // high-order contexts only pay when blended with a dense low-order model,
+  // which is exactly the CM mixing advantage -- the planned P2b literal
+  // blend (o1 + hashed-o2 with adaptive per-bucket weight) follows from this.
+  static const uint32_t kPrev2Bits = 4;
   NibModel tok[kTokKinds * kTokKinds];   // ctx: (prev kind, kind before that)
-  NibModel lit_hi[512 * 16];             // (prev|256+match_byte, prev2 >> 4)
+  NibModel lit_hi[512u << kPrev2Bits];   // (prev|256+match_byte, prev2 bits)
   NibModel lit_lo[512 * 16];             // (prev|256+match_byte, hi)
   NibModel len_lo[5];                    // 0: match, 1: rep0, 2: rep1/2, 3: after-lit rep0, 4: lzp
   NibModel len_mid_hi[5];                // slot-14 lengths: value/16 (0..3)
@@ -263,8 +270,14 @@ struct Models {
   NibModel dist_lo[2][4];                // ctx: (len >= 8, hi)
   NibModel dist_align[2];                // low 4 bits of large distances
 
-  ALWAYS_INLINE static size_t LitBase(uint32_t prev, bool post_match, uint32_t match_byte) {
-    return (post_match ? 256u + match_byte : prev) * 16u;
+  ALWAYS_INLINE static size_t LitPrimary(uint32_t prev, bool post_match, uint32_t match_byte) {
+    return post_match ? 256u + match_byte : prev;
+  }
+  ALWAYS_INLINE static size_t LitHiCtx(size_t primary, uint32_t prev2) {
+    return (primary << kPrev2Bits) | (prev2 >> (8 - kPrev2Bits));
+  }
+  ALWAYS_INLINE static size_t LitLoCtx(size_t primary, uint32_t hi) {
+    return primary * 16u + hi;
   }
   ALWAYS_INLINE static size_t LenCtx(uint32_t kind, uint32_t prev_kind) {
     if (kind == kTokMatch) return 0;
@@ -477,11 +490,11 @@ public:
       // Costs (1/16 bit units) against the current models.
       const NibModel& tokm = models.tok[prev_kind * kTokKinds + prev_kind2];
       const uint32_t match_byte = post_match ? in[pos - reps[0]] : 0;
-      const size_t lit_base = Models::LitBase(prev1, post_match, match_byte);
+      const size_t lit_primary = Models::LitPrimary(prev1, post_match, match_byte);
       const uint32_t c0 = in[pos];
       const uint32_t lit_cost = CostNib(tokm, kTokLit) +
-        CostNib(models.lit_hi[lit_base + (prev2 >> 4)], c0 >> 4) +
-        CostNib(models.lit_lo[lit_base + (c0 >> 4)], c0 & 15);
+        CostNib(models.lit_hi[Models::LitHiCtx(lit_primary, prev2)], c0 >> 4) +
+        CostNib(models.lit_lo[Models::LitLoCtx(lit_primary, c0 >> 4)], c0 & 15);
 
       uint32_t rep_avg = ~0u;
       if (best_rep_len != 0) {
@@ -621,9 +634,9 @@ private:
     const uint32_t c = in[pos];
     const uint32_t match_byte = post_match ? in[pos - reps[0]] : 0;
     const uint32_t hi = c >> 4;
-    const size_t base = Models::LitBase(prev1, post_match, match_byte);
-    enc_.PutNib(models.lit_hi[base + (prev2 >> 4)], hi);
-    enc_.PutNib(models.lit_lo[base + hi], c & 15);
+    const size_t primary = Models::LitPrimary(prev1, post_match, match_byte);
+    enc_.PutNib(models.lit_hi[Models::LitHiCtx(primary, prev2)], hi);
+    enc_.PutNib(models.lit_lo[Models::LitLoCtx(primary, hi)], c & 15);
     prev2 = prev1;
     prev1 = c;
     ++pos;
@@ -742,9 +755,9 @@ public:
         if (kind == kTokLit) {
           if (pos >= raw_len) return 0;
           const uint32_t match_byte = post_match ? out[pos - reps[0]] : 0;
-          const size_t base = Models::LitBase(prev1, post_match, match_byte);
-          const size_t hi = dec_.GetNib(models.lit_hi[base + (prev2 >> 4)]);
-          const size_t lo = dec_.GetNib(models.lit_lo[base + hi]);
+          const size_t primary = Models::LitPrimary(prev1, post_match, match_byte);
+          const size_t hi = dec_.GetNib(models.lit_hi[Models::LitHiCtx(primary, prev2)]);
+          const size_t lo = dec_.GetNib(models.lit_lo[Models::LitLoCtx(primary, hi)]);
           const uint8_t c = static_cast<uint8_t>((hi << 4) | lo);
           out[pos++] = c;
           prev2 = prev1;
