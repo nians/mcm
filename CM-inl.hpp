@@ -21,6 +21,9 @@
     along with MCM.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#ifndef _CM_INL_HPP_
+#define _CM_INL_HPP_
+
 #include "CM.hpp"
 
 namespace cm {
@@ -675,3 +678,5 @@ inline void CM<kInputs, kUseSSE, HistoryType>::OptimalCtxState() {
 }
 
 }
+
+#endif  // _CM_INL_HPP_

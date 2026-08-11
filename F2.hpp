@@ -32,13 +32,18 @@
 #include <cstring>
 #include <vector>
 
+// F2_NO_ARCHIVE builds only the core codec (standalone tests) without the
+// embedded-CM selector wrapper and its heavy dependency chain.
+#ifndef F2_NO_ARCHIVE
+#include "CM-inl.hpp"
+#endif
 #include "Compressor.hpp"
 #include "Stream.hpp"
 #include "Util.hpp"
 
 namespace f2 {
 
-static const size_t kChunkSize = 64 * MB;  // window == chunk
+static const size_t kChunkSize = 16 * MB;  // window == chunk == selector granularity
 static const size_t kSegTokens = 128 * 1024;
 static const uint32_t kProbBits = 12;
 static const uint32_t kProbScale = 1u << kProbBits;
@@ -880,23 +885,88 @@ inline bool MemDecompress(const uint8_t* in, size_t n, uint8_t* out, size_t out_
   return out_pos == out_n;
 }
 
+#ifndef F2_NO_ARCHIVE
 // ---------------------------------------------------------------------------
-// Stream Compressor wrapper for the Archive container.
+// Stream Compressor wrapper for the Archive container, with the ratio-budget
+// selector: every chunk is trial-compressed with both F2 and an embedded CM
+// fast-mode engine, and F2 is kept only while the cumulative size overhead
+// stays inside kBudgetPermille of the cumulative CM size. This makes the
+// compression-ratio bound a construction-level guarantee (worst case is the
+// all-CM encoding), while decode speed rises automatically as the F2 gap
+// narrows corpus by corpus.
 class F2 : public Compressor {
 public:
+  // 2% against the chunked-CM total; the extra percent of the 3% target is
+  // reserved for the CM chunking penalty relative to a continuous -f stream.
+  enum : uint64_t { kBudgetPermille = 20 };
+  enum : uint8_t { kModeCM = 2 };
+
+  F2(const FrequencyCounter<256>& freq, Detector::Profile profile)
+    : freq_(freq), profile_(profile) {}
+
+  static uint8_t CmMemForChunk(size_t chunk_size) {
+    uint8_t level = 0;
+    while (level < 8 && ((uint64_t(2) * MB) << level) < 8 * uint64_t(chunk_size)) {
+      ++level;
+    }
+    return level;
+  }
+
   virtual void compress(Stream* in, Stream* out, uint64_t max_count) OVERRIDE {
     F2Encoder enc;
     std::vector<Models> models(1);
+    std::vector<Models> snapshot(1);
     uint32_t prev1 = 0, prev2 = 0;
     std::vector<uint8_t> buf(kChunkSize);
-    std::vector<uint8_t> comp;
+    std::vector<uint8_t> f2_payload;
+    uint64_t cm_total = 0;   // cumulative CM sizes (the reference encoding)
+    int64_t spent = 0;       // cumulative F2 overhead vs that reference
     while (max_count > 0) {
       const size_t want = static_cast<size_t>(std::min<uint64_t>(max_count, kChunkSize));
       const size_t got = in->read(buf.data(), want);
       if (got == 0) break;
-      comp.clear();
-      enc.CompressChunk(buf.data(), got, comp, models[0], prev1, prev2);
-      out->write(comp.data(), comp.size());
+      // Trial 1: F2 (adapts models; snapshot lets us roll back if CM wins).
+      snapshot[0] = models[0];
+      const uint32_t old_prev1 = prev1, old_prev2 = prev2;
+      f2_payload.clear();
+      enc.CompressChunk(buf.data(), got, f2_payload, models[0], prev1, prev2);
+      // Trial 2: embedded CM fast engine over the same bytes.
+      std::vector<uint8_t> cm_data;
+      const uint8_t cm_mem = CmMemForChunk(got);
+      {
+        cm::CM<4, false> cm_engine(freq_, cm_mem, true, profile_);
+        ReadMemoryStream rms(buf.data(), buf.data() + got);
+        WriteVectorStream wvs(&cm_data);
+        cm_engine.compress(&rms, &wvs, got);
+      }
+      cm_total += cm_data.size();
+      const int64_t extra = static_cast<int64_t>(f2_payload.size()) -
+        static_cast<int64_t>(cm_data.size());
+      const int64_t budget = static_cast<int64_t>(cm_total * kBudgetPermille / 1000);
+      if (spent + extra <= budget) {
+        // F2 stays within the ratio budget: keep it.
+        spent += extra;
+        scratch_.clear();
+        F2Encoder::WriteLeb(scratch_, f2_payload.size());
+        out->write(scratch_.data(), scratch_.size());
+        out->write(f2_payload.data(), f2_payload.size());
+      } else {
+        // CM wins: roll back the F2 model updates so the decoder (which will
+        // never see this chunk's F2 symbols) stays in sync.
+        models[0] = snapshot[0];
+        prev1 = got ? buf[got - 1] : old_prev1;
+        prev2 = got >= 2 ? buf[got - 2] : old_prev1;
+        (void)old_prev2;
+        scratch_.clear();
+        std::vector<uint8_t> payload;
+        F2Encoder::WriteLeb(payload, got);
+        payload.push_back(kModeCM);
+        payload.push_back(cm_mem);
+        payload.insert(payload.end(), cm_data.begin(), cm_data.end());
+        F2Encoder::WriteLeb(scratch_, payload.size());
+        out->write(scratch_.data(), scratch_.size());
+        out->write(payload.data(), payload.size());
+      }
       max_count -= got;
     }
   }
@@ -920,18 +990,43 @@ public:
       if (payload == 0) return;
       comp.resize(payload);
       if (in->read(comp.data(), payload) != payload) return;
-      // Peek raw_len to size the output buffer.
       const uint8_t* peek = comp.data();
-      const size_t raw_len = F2Decoder::ReadLeb(peek, comp.data() + payload);
+      const uint8_t* peek_end = comp.data() + payload;
+      const size_t raw_len = F2Decoder::ReadLeb(peek, peek_end);
+      if (peek >= peek_end || raw_len > kChunkSize) return;
       if (raw_len > raw.size()) raw.resize(raw_len);
-      const size_t got = dec.DecompressChunk(comp.data(), payload, raw.data(), raw.size(),
-                                             models[0], prev1, prev2);
-      if (got == 0) return;
+      size_t got = 0;
+      if (*peek == kModeCM) {
+        ++peek;
+        if (peek >= peek_end) return;
+        const uint8_t cm_mem = *peek++;
+        cm::CM<4, false> cm_engine(freq_, cm_mem, true, profile_);
+        ReadMemoryStream rms(peek, peek_end);
+        WriteVectorStream wvs(&cm_scratch_);
+        cm_scratch_.clear();
+        cm_engine.decompress(&rms, &wvs, raw_len);
+        if (cm_scratch_.size() != raw_len) return;
+        memcpy(raw.data(), cm_scratch_.data(), raw_len);
+        got = raw_len;
+        prev1 = raw_len ? raw[raw_len - 1] : prev1;
+        prev2 = raw_len >= 2 ? raw[raw_len - 2] : prev1;
+      } else {
+        got = dec.DecompressChunk(comp.data(), payload, raw.data(), raw.size(),
+                                  models[0], prev1, prev2);
+        if (got == 0) return;
+      }
       out->write(raw.data(), got);
       max_count -= std::min<uint64_t>(max_count, got);
     }
   }
+
+private:
+  FrequencyCounter<256> freq_;
+  Detector::Profile profile_;
+  std::vector<uint8_t> scratch_;
+  std::vector<uint8_t> cm_scratch_;
 };
+#endif  // F2_NO_ARCHIVE
 
 }  // namespace f2
 

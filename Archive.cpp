@@ -149,7 +149,7 @@ Compressor* Archive::Algorithm::CreateCompressor(const FrequencyCounter<256>& fr
   case Compressor::kTypeCMHigh: return new cm::CM<10, /*sse*/false>(freq, mem_usage_, lzp_enabled_, profile_);
   case Compressor::kTypeCMMax: return new cm::CM<13, /*sse*/true>(freq, mem_usage_, lzp_enabled_, profile_);
   case Compressor::kTypeCMSimple: return new cm::CM<6, false>(freq, mem_usage_, lzp_enabled_, Detector::kProfileSimple);
-  case Compressor::kTypeMCMF2: return new f2::F2;
+  case Compressor::kTypeMCMF2: return new f2::F2(freq, profile_);
   }
   return nullptr;
 }

@@ -165,6 +165,10 @@ public:
   virtual uint64_t tell() const {
     return pos_ - buffer_;
   }
+  virtual void seek(uint64_t pos) {
+    const uint64_t size = limit_ - buffer_;
+    pos_ = buffer_ + (pos <= size ? pos : size);
+  }
 
 private:
   const uint8_t* const buffer_;
