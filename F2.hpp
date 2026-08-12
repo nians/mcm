@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <vector>
 
 // SSE2 is baseline on x86-64; every 16-lane model loop below (CDF blend,
@@ -251,12 +252,18 @@ static const uint32_t kSpeedBias = F2_SPEED_BIAS;
 #else
 static const uint32_t kSpeedBias = 4;
 #endif
-// The o4 stage belongs to the rate corner. At speed-leaning parses most of
-// the literals it could improve are gone while its per-literal decode cost
-// stays, so rate-leaning builds enable it and speed-leaning builds ship
-// without it -- one header byte per chunk carries the decision to the
-// decoder, which has no compile-time lambda of its own.
-static const bool kUseO4 = kSpeedBias < 3;
+// Literal coder tier, carried per chunk in a header byte so the decoder (which
+// has no compile-time lambda of its own) simply obeys the encoder's choice:
+//   0 = two-model CDF blend            (speed corner)
+//   1 = + o4 cascade with shadow ledger (intermediate; F2_LIT_TIER=1)
+//   2 = binary-mixed literals           (rate corner: the mini-CM tier)
+// Rate-leaning builds take tier 2; speed-leaning builds ship tier 0.
+#ifdef F2_LIT_TIER
+static const int kLitTier = F2_LIT_TIER;
+#else
+static const int kLitTier = kSpeedBias < 3 ? 2 : 0;
+#endif
+static const bool kUseO4 = kLitTier == 1;
 
 ALWAYS_INLINE void BlendCdf(const uint16_t* a, const uint16_t* b, uint32_t w,
                             uint16_t* out) {
@@ -324,6 +331,197 @@ ALWAYS_INLINE void UpdateBlendWeight2(uint8_t* w, uint32_t fa, uint32_t fb) {
 inline const uint16_t* CostTable();
 
 // ---------------------------------------------------------------------------
+// Binary-mixed literal tier (rate corner). Literals are coded MSB-first as 8
+// binary decisions; each bit's probability is a learned logistic-domain mix
+// of five predictors (bias/o1/o2-hash/o4-hash/predicted-byte). This is a
+// miniature of the CM mixer -- the piece the study identified as the actual
+// source of the remaining rate gap -- confined to literals and to chunks
+// whose header opts in, so the speed corner never pays for it.
+//
+// All arithmetic is integer and identical on both sides. The stretch/squash
+// tables are built once from libm doubles; encoder and decoder of one archive
+// run in one process, and cross-build decode additionally relies on libm
+// giving the same rounding for these 4096 points (true in practice for glibc;
+// the F2 format is still branch-internal).
+static const int kStClamp = 2047;         // stretch output clamp
+static const int kPClamp = 4096;          // probability scale (reuses kProbScale)
+
+inline const int16_t* StretchTab() {
+  static std::vector<int16_t> t;
+  if (t.empty()) {
+    t.resize(kPClamp);
+    for (int p = 0; p < kPClamp; ++p) {
+      const double pp = (p < 1 ? 1 : p) / 4096.0;
+      const int v = static_cast<int>(std::lround(std::log(pp / (1.0 - pp)) * 256.0));
+      t[p] = static_cast<int16_t>(v < -kStClamp ? -kStClamp : (v > kStClamp ? kStClamp : v));
+    }
+  }
+  return t.data();
+}
+
+inline const uint16_t* SquashTab() {
+  static std::vector<uint16_t> t;
+  if (t.empty()) {
+    t.resize(2 * kStClamp + 2);
+    for (int i = 0; i < 2 * kStClamp + 2; ++i) {
+      const double x = (i - kStClamp - 1) / 256.0;
+      int v = static_cast<int>(std::lround(4096.0 / (1.0 + std::exp(-x))));
+      if (v < 1) v = 1;
+      if (v > 4095) v = 4095;
+      t[i] = static_cast<uint16_t>(v);
+    }
+  }
+  return t.data();
+}
+
+// One binary counter: 12-bit probability of bit==1 plus a saturation stage.
+struct BitModel {
+  uint16_t p = 2048;
+  uint16_t cnt = 0;
+  ALWAYS_INLINE void Update(int bit) {
+    const int rate = cnt < 32 ? 3 : (cnt < 256 ? 4 : 5);
+    cnt += cnt < 256;
+    const int target = bit ? 4095 : 1;
+    p = static_cast<uint16_t>(p + ((target - static_cast<int>(p)) >> rate));
+  }
+};
+
+static const size_t kBinHashBits = 21;   // o2/o4 bit-model table size
+#ifdef F2_MIX_LR
+static const size_t kBinMixLR = F2_MIX_LR;
+#else
+static const size_t kBinMixLR = 11;              // mixer learning-rate shift
+#endif
+static const int32_t kBinWCap = 1 << 20;
+
+struct BinLitModels {
+  BitModel o1[256 * 256];                  // [prev1][node]
+  BitModel o2[1u << kBinHashBits];
+  BitModel o3[1u << kBinHashBits];
+  BitModel o4[1u << kBinHashBits];
+  BitModel pred[257 * 256];                // [predicted byte | 256=none][node]
+  BitModel o0[256];                        // [node]
+  int32_t w[256 * 16][6];                  // mixer weights per (node, o1 class)
+  uint16_t apm[256][33];                   // SSE transfer per node, 32 buckets
+
+  void Init() {
+    // Aggregate init: BitModel default state as a pattern fill.
+    const BitModel init;
+    std::fill(o1, o1 + 256 * 256, init);
+    std::fill(o2, o2 + (1u << kBinHashBits), init);
+    std::fill(o3, o3 + (1u << kBinHashBits), init);
+    std::fill(o4, o4 + (1u << kBinHashBits), init);
+    std::fill(pred, pred + 257 * 256, init);
+    std::fill(o0, o0 + 256, init);
+    for (int n = 0; n < 256 * 16; ++n) {
+      for (int k = 0; k < 6; ++k) w[n][k] = 1 << 14;
+    }
+    // Identity transfer: bucket centers map to their own squashed value.
+    for (int n = 0; n < 256; ++n) {
+      for (int b = 0; b <= 32; ++b) {
+        int st = b * 128 - 2048;
+        if (st < -kStClamp) st = -kStClamp;
+        if (st > kStClamp) st = kStClamp;
+        apm[n][b] = SquashTab()[st + kStClamp + 1];
+      }
+    }
+  }
+
+  ALWAYS_INLINE static uint32_t Hash2(uint32_t p1, uint32_t p2) {
+    return ((p1 | (p2 << 8)) * 2654435761u) >> (32 - kBinHashBits);
+  }
+  ALWAYS_INLINE static uint32_t Hash3(uint32_t p1, uint32_t p2, uint32_t p3) {
+    return ((p1 | (p2 << 8) | (p3 << 16)) * 2654435761u) >> (32 - kBinHashBits);
+  }
+  ALWAYS_INLINE static uint32_t Hash4(uint32_t p1, uint32_t p2, uint32_t p3,
+                                      uint32_t p4) {
+    return ((p1 | (p2 << 8) | (p3 << 16) | (p4 << 24)) * 2654435761u) >>
+           (32 - kBinHashBits);
+  }
+  ALWAYS_INLINE static uint32_t Fold(uint32_t h, uint32_t node) {
+    return (h ^ (node * 0x1000193u)) & ((1u << kBinHashBits) - 1);
+  }
+};
+
+// Per-literal context handles; hashes are computed once per literal and only
+// folded with the tree node per bit.
+struct BinLitCtx {
+  uint32_t o1_base, h2, h3, h4, pred_base, wsel;
+  ALWAYS_INLINE static BinLitCtx Make(uint32_t p1, uint32_t p2, uint32_t p3,
+                                      uint32_t p4, uint32_t pred_byte_or_256) {
+    BinLitCtx c;
+    c.o1_base = p1 << 8;
+    c.h2 = BinLitModels::Hash2(p1, p2);
+    c.h3 = BinLitModels::Hash3(p1, p2, p3);
+    c.h4 = BinLitModels::Hash4(p1, p2, p3, p4);
+    c.pred_base = pred_byte_or_256 << 8;
+    c.wsel = (p1 >> 4) & 15;
+    return c;
+  }
+};
+
+// One probe: models, stretched inputs, mixer row, mixed probability, and the
+// SSE stage on top. The final probability averages the mixer with the learned
+// transfer (3:1 toward the transfer, the classic weighting).
+struct BinLitProbe {
+  BitModel* m[6];
+  int32_t st[6];
+  int32_t* w;
+  uint16_t* apm_slot;
+  uint32_t p_mix;
+  uint32_t p_final;
+};
+
+ALWAYS_INLINE uint32_t BinLitMix(BinLitModels& B, const BinLitCtx& ctx,
+                                 uint32_t node, BinLitProbe& pr) {
+  const int16_t* stab = StretchTab();
+  pr.m[0] = &B.o0[node];
+  pr.m[1] = &B.o1[ctx.o1_base | node];
+  pr.m[2] = &B.o2[BinLitModels::Fold(ctx.h2, node)];
+  pr.m[3] = &B.o3[BinLitModels::Fold(ctx.h3, node)];
+  pr.m[4] = &B.o4[BinLitModels::Fold(ctx.h4, node)];
+  pr.m[5] = &B.pred[ctx.pred_base | node];
+  int64_t dot = 0;
+  pr.w = B.w[(node << 4) | ctx.wsel];
+  for (int k = 0; k < 6; ++k) {
+    pr.st[k] = stab[pr.m[k]->p];
+    dot += static_cast<int64_t>(pr.w[k]) * pr.st[k];
+  }
+  int32_t sm = static_cast<int32_t>(dot >> 16);
+  if (sm < -kStClamp) sm = -kStClamp;
+  if (sm > kStClamp) sm = kStClamp;
+  pr.p_mix = SquashTab()[sm + kStClamp + 1];
+  // SSE: piecewise-linear learned transfer over the stretch domain.
+  const uint32_t u = static_cast<uint32_t>(sm + 2048);
+  const uint32_t b = u >> 7;
+  const uint32_t frac = u & 127;
+  uint16_t* t = B.apm[node];
+  pr.apm_slot = &t[frac >= 64 ? b + 1 : b];
+  const uint32_t p_sse = t[b] + (((t[b + 1] - t[b]) * static_cast<int32_t>(frac)) >> 7);
+  // 1:3 toward the mixer: SSE corrects miscalibration where the models are
+  // noisy (binary data) and stays neutral where the mixer is already sharp.
+  uint32_t p = (p_sse + 3 * pr.p_mix) >> 2;
+  if (p < 1) p = 1;
+  if (p > 4095) p = 4095;
+  pr.p_final = p;
+  return p;
+}
+
+ALWAYS_INLINE void BinLitLearn(BinLitProbe& pr, int bit) {
+  const int32_t err = (bit ? 4095 : 0) - static_cast<int32_t>(pr.p_mix);
+  for (int k = 0; k < 6; ++k) {
+    int32_t nw = pr.w[k] + ((pr.st[k] * err) >> kBinMixLR);
+    if (nw < -kBinWCap) nw = -kBinWCap;
+    if (nw > kBinWCap) nw = kBinWCap;
+    pr.w[k] = nw;
+    pr.m[k]->Update(bit);
+  }
+  const int32_t target = bit ? 4095 : 1;
+  *pr.apm_slot = static_cast<uint16_t>(
+      *pr.apm_slot + ((target - static_cast<int32_t>(*pr.apm_slot)) >> 6));
+}
+
+// ---------------------------------------------------------------------------
 // rANS encoder. Symbols are recorded forward (while the models adapt), then a
 // segment is encoded in reverse into a scratch buffer.
 struct EncEvent {
@@ -377,6 +575,13 @@ public:
     UpdateBlendWeight(w1, a.Freq(sym), b.Freq(sym));
     a.Update(sym);
     b.Update(sym);
+  }
+
+  // Binary symbol with explicit 12-bit probability of bit==1.
+  ALWAYS_INLINE void PutBitP(uint32_t p1, int bit) {
+    events_.push_back(bit
+      ? EncEvent{0, static_cast<uint16_t>(p1)}
+      : EncEvent{static_cast<uint16_t>(p1), static_cast<uint16_t>(kProbScale - p1)});
   }
 
   ALWAYS_INLINE void PutBits(uint32_t bits, uint32_t nbits) {
@@ -482,6 +687,14 @@ public:
     return sym;
   }
 
+  ALWAYS_INLINE int GetBitP(uint32_t p1) {
+    const uint32_t slot = x_ & (kProbScale - 1);
+    const int bit = slot < p1;
+    x_ = (bit ? p1 : kProbScale - p1) * (x_ >> kProbBits) + slot - (bit ? 0 : p1);
+    while (x_ < kRansL) x_ = (x_ << 8) | Get();
+    return bit;
+  }
+
   ALWAYS_INLINE uint32_t GetBits(uint32_t nbits) {
     uint32_t bits = 0, got = 0;
     while (nbits > 15) {
@@ -570,11 +783,15 @@ struct Models {
   uint32_t o4_tick_ = 0;
   bool o4_on_ = true;
 
+  // Binary-mixed literal tier state (used only when the chunk opts in).
+  BinLitModels bin;
+
   Models() {
     memset(bw_hi, kBlendInitW, sizeof(bw_hi));
     memset(bw_lo, kBlendInitW, sizeof(bw_lo));
     memset(bw2_hi, kBlend2InitW, sizeof(bw2_hi));
     memset(bw2_lo, kBlend2InitW, sizeof(bw2_lo));
+    bin.Init();
   }
 
   // Hysteresis: staying on needs a non-negative ledger, but reviving from
@@ -635,6 +852,56 @@ inline const uint16_t* CostTable() {
 
 ALWAYS_INLINE uint32_t CostNib(const NibModel& m, size_t sym) {
   return CostTable()[m.Freq(sym)];
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2 literal codec: 8 mixed binary decisions, MSB first. Encoder, decoder
+// and price oracle walk the identical probe/mix; only the bit source and the
+// presence of updates differ. The effective predicted byte folds the LZP
+// candidate and the post-match continuation byte into the same slot -- the
+// two sources are exclusive by construction and both mean "the byte a
+// content-addressed model expects next".
+ALWAYS_INLINE void BinLitEncode(SegmentEncoder& enc, Models& models,
+                                const BinLitCtx& ctx, uint32_t c) {
+  uint32_t node = 1;
+  for (int i = 7; i >= 0; --i) {
+    BinLitProbe pr;
+    const uint32_t p1 = BinLitMix(models.bin, ctx, node, pr);
+    const int bit = (c >> i) & 1;
+    enc.PutBitP(p1, bit);
+    BinLitLearn(pr, bit);
+    node = (node << 1) | bit;
+  }
+}
+
+ALWAYS_INLINE uint32_t BinLitDecode(SegmentDecoder& dec, Models& models,
+                                    const BinLitCtx& ctx) {
+  uint32_t node = 1;
+  for (int i = 0; i < 8; ++i) {
+    BinLitProbe pr;
+    const uint32_t p1 = BinLitMix(models.bin, ctx, node, pr);
+    const int bit = dec.GetBitP(p1);
+    BinLitLearn(pr, bit);
+    node = (node << 1) | bit;
+  }
+  return node & 0xFF;
+}
+
+// Price of coding byte c here, in 1/16-bit units, against the live models
+// (no updates -- same freshness contract as CostNibBlended3).
+ALWAYS_INLINE uint32_t BinLitCost(Models& models, const BinLitCtx& ctx,
+                                  uint32_t c) {
+  const uint16_t* cost = CostTable();
+  uint32_t total = 0;
+  uint32_t node = 1;
+  for (int i = 7; i >= 0; --i) {
+    BinLitProbe pr;
+    const uint32_t p1 = BinLitMix(models.bin, ctx, node, pr);
+    const int bit = (c >> i) & 1;
+    total += cost[bit ? p1 : kProbScale - p1];
+    node = (node << 1) | bit;
+  }
+  return total;
 }
 
 // Distance slotting, LZMA style: 1..3 direct, otherwise slot encodes the top
@@ -874,20 +1141,28 @@ public:
           const uint32_t p3 = abs >= 3 ? in[abs - 3] : (i == 0 ? prev3 : 0);
           const uint32_t p4 = abs >= 4 ? in[abs - 4] : (i == 0 ? prev4 : 0);
           const uint32_t c0 = in[abs];
-          const size_t primary = pred_[i] != kNoPred ? 256u + pred_[i] : (p1 & 0xFF);
-          const size_t o3h = Models::O3Hash(p1, p2, p3);
-          const size_t o4h = Models::O4Hash(p1, p2, p3, p4);
-          const size_t lob4 = Models::LoBucket(o4h, c0 >> 4);
-          const uint32_t lc = tok_price[av][kTokLit] +
-            CostNibBlended3(models.lit_hi[Models::LitHiCtx(primary, p2)],
-                            models.blend_hi[o3h], models.bw_hi[o3h],
-                            models.blend2_hi[o4h], models.bw2_hi[o4h],
-                            models.o4_on_, c0 >> 4) +
-            CostNibBlended3(models.lit_lo[Models::LitLoCtx(primary, c0 >> 4)],
-                            models.blend_lo[Models::LoBucket(o3h, c0 >> 4)],
-                            models.bw_lo[Models::LoBucket(o3h, c0 >> 4)],
-                            models.blend2_lo[lob4], models.bw2_lo[lob4],
-                            models.o4_on_, c0 & 15);
+          uint32_t lc = tok_price[av][kTokLit];
+          if (kLitTier == 2) {
+            // Post-match continuation is approximated as absent while pricing
+            // (matching the tier-0/1 convention above).
+            const uint32_t pb = pred_[i] != kNoPred ? pred_[i] : 256u;
+            lc += BinLitCost(models, BinLitCtx::Make(p1, p2, p3, p4, pb), c0);
+          } else {
+            const size_t primary = pred_[i] != kNoPred ? 256u + pred_[i] : (p1 & 0xFF);
+            const size_t o3h = Models::O3Hash(p1, p2, p3);
+            const size_t o4h = kUseO4 ? Models::O4Hash(p1, p2, p3, p4) : 0;
+            const size_t lob4 = kUseO4 ? Models::LoBucket(o4h, c0 >> 4) : 0;
+            lc +=
+              CostNibBlended3(models.lit_hi[Models::LitHiCtx(primary, p2)],
+                              models.blend_hi[o3h], models.bw_hi[o3h],
+                              models.blend2_hi[o4h], models.bw2_hi[o4h],
+                              models.o4_on_, c0 >> 4) +
+              CostNibBlended3(models.lit_lo[Models::LitLoCtx(primary, c0 >> 4)],
+                              models.blend_lo[Models::LoBucket(o3h, c0 >> 4)],
+                              models.bw_lo[Models::LoBucket(o3h, c0 >> 4)],
+                              models.blend2_lo[lob4], models.bw2_lo[lob4],
+                              models.o4_on_, c0 & 15);
+          }
           relax(i + 1, base_cost + lc + kSpeedBias * 4, kTokLit, 1, 0);
         }
         // Rep candidates against the span-entry rep list; emission re-maps or
@@ -1013,7 +1288,7 @@ public:
     std::vector<uint8_t> body;
     WriteLeb(body, n);
     body.push_back(0);  // mode 0: entropy-coded
-    body.push_back(kUseO4 ? 1 : 0);  // o4 literal stage active in this chunk
+    body.push_back(static_cast<uint8_t>(kLitTier));  // literal coder tier
     WriteLeb(body, seg_meta.size());
     size_t off = 0;
     for (const auto& sm : seg_meta) {
@@ -1091,17 +1366,23 @@ private:
     fprintf(F2TraceFile(0), "L %zu pri=%zu o3=%zu o4=%zu p1=%u p2=%u p3=%u pm=%d r0=%zu\n",
             pos, primary, o3h, o4h, prev1, prev2, prev3, (int)post_match, reps[0]);
 #endif
-    enc_.PutNibBlended3(models.lit_hi[Models::LitHiCtx(primary, prev2)],
-                        models.blend_hi[o3h], &models.bw_hi[o3h],
-                        models.blend2_hi[o4h], &models.bw2_hi[o4h],
-                        kUseO4, models.o4_on_, &models.o4_gain_, hi);
-    const size_t lob = Models::LoBucket(o3h, hi);
-    const size_t lob4 = kUseO4 ? Models::LoBucket(o4h, hi) : 0;
-    enc_.PutNibBlended3(models.lit_lo[Models::LitLoCtx(primary, hi)],
-                        models.blend_lo[lob], &models.bw_lo[lob],
-                        models.blend2_lo[lob4], &models.bw2_lo[lob4],
-                        kUseO4, models.o4_on_, &models.o4_gain_, c & 15);
-    if (kUseO4) models.O4Tick();
+    if (kLitTier == 2) {
+      const uint32_t pb = primary >= 256u ? static_cast<uint32_t>(primary - 256u) : 256u;
+      BinLitEncode(enc_, models,
+                   BinLitCtx::Make(prev1, prev2, prev3, prev4, pb), c);
+    } else {
+      enc_.PutNibBlended3(models.lit_hi[Models::LitHiCtx(primary, prev2)],
+                          models.blend_hi[o3h], &models.bw_hi[o3h],
+                          models.blend2_hi[o4h], &models.bw2_hi[o4h],
+                          kUseO4, models.o4_on_, &models.o4_gain_, hi);
+      const size_t lob = Models::LoBucket(o3h, hi);
+      const size_t lob4 = kUseO4 ? Models::LoBucket(o4h, hi) : 0;
+      enc_.PutNibBlended3(models.lit_lo[Models::LitLoCtx(primary, hi)],
+                          models.blend_lo[lob], &models.bw_lo[lob],
+                          models.blend2_lo[lob4], &models.bw2_lo[lob4],
+                          kUseO4, models.o4_on_, &models.o4_gain_, c & 15);
+      if (kUseO4) models.O4Tick();
+    }
     prev4 = prev3;
     prev3 = prev2;
     prev2 = prev1;
@@ -1310,7 +1591,9 @@ public:
       return raw_len;
     }
     if (p >= in_end) return 0;
-    const bool use_o4 = *p++ != 0;
+    const uint8_t lit_tier = *p++;
+    if (lit_tier > 2) return 0;  // corrupt
+    const bool use_o4 = lit_tier == 1;
     const size_t n_segments = ReadLeb(p, in_end);
     lzp_.Reset();
     size_t lzp_ptr = 0;
@@ -1346,20 +1629,28 @@ public:
           fprintf(F2TraceFile(1), "L %zu pri=%zu o3=%zu o4=%zu p1=%u p2=%u p3=%u pm=%d r0=%zu\n",
                   pos, primary, o3h, o4h, prev1, prev2, prev3, (int)post_match, reps[0]);
 #endif
-          const size_t hi = dec_.GetNibBlended3(
-            models.lit_hi[Models::LitHiCtx(primary, prev2)],
-            models.blend_hi[o3h], &models.bw_hi[o3h],
-            models.blend2_hi[o4h], &models.bw2_hi[o4h],
-            use_o4, models.o4_on_, &models.o4_gain_);
-          const size_t lob = Models::LoBucket(o3h, hi);
-          const size_t lob4 = use_o4 ? Models::LoBucket(o4h, hi) : 0;
-          const size_t lo = dec_.GetNibBlended3(
-            models.lit_lo[Models::LitLoCtx(primary, hi)],
-            models.blend_lo[lob], &models.bw_lo[lob],
-            models.blend2_lo[lob4], &models.bw2_lo[lob4],
-            use_o4, models.o4_on_, &models.o4_gain_);
-          if (use_o4) models.O4Tick();
-          const uint8_t c = static_cast<uint8_t>((hi << 4) | lo);
+          uint8_t c;
+          if (lit_tier == 2) {
+            const uint32_t pb =
+              primary >= 256u ? static_cast<uint32_t>(primary - 256u) : 256u;
+            c = static_cast<uint8_t>(BinLitDecode(
+              dec_, models, BinLitCtx::Make(prev1, prev2, prev3, prev4, pb)));
+          } else {
+            const size_t hi = dec_.GetNibBlended3(
+              models.lit_hi[Models::LitHiCtx(primary, prev2)],
+              models.blend_hi[o3h], &models.bw_hi[o3h],
+              models.blend2_hi[o4h], &models.bw2_hi[o4h],
+              use_o4, models.o4_on_, &models.o4_gain_);
+            const size_t lob = Models::LoBucket(o3h, hi);
+            const size_t lob4 = use_o4 ? Models::LoBucket(o4h, hi) : 0;
+            const size_t lo = dec_.GetNibBlended3(
+              models.lit_lo[Models::LitLoCtx(primary, hi)],
+              models.blend_lo[lob], &models.bw_lo[lob],
+              models.blend2_lo[lob4], &models.bw2_lo[lob4],
+              use_o4, models.o4_on_, &models.o4_gain_);
+            if (use_o4) models.O4Tick();
+            c = static_cast<uint8_t>((hi << 4) | lo);
+          }
           out[pos++] = c;
           prev4 = prev3;
           prev3 = prev2;
