@@ -32,6 +32,17 @@
 #include <cstring>
 #include <vector>
 
+// SSE2 is baseline on x86-64; every 16-lane model loop below (CDF blend,
+// symbol lookup, model update) has a hand-written vector path because the
+// autovectorizer takes none of them (short trip counts, data-dependent exits).
+// The vector paths are bit-exact with the scalar ones -- encoder and decoder
+// models must stay in lockstep no matter which build runs on which side.
+#if !defined(F2_FORCE_SCALAR) && (defined(__SSE2__) || defined(_M_X64) || \
+    (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define F2_SSE2 1
+#include <emmintrin.h>
+#endif
+
 // F2_NO_ARCHIVE builds only the core codec (standalone tests) without the
 // embedded-CM selector wrapper and its heavy dependency chain.
 #ifndef F2_NO_ARCHIVE
@@ -72,6 +83,32 @@ static const uint32_t kLzpBits = 18;
 static const size_t kMinLzpLen = 2;
 static const uint32_t kLzpNil = 0xFFFFFFFFu;
 static const uint16_t kNoPred = 0xFFFF;
+
+// Branch-free symbol lookup over a 17-entry nibble CDF: the predicate
+// cdf[i] <= slot holds on a prefix (strict monotonicity), so the popcount of
+// the compare mask IS the symbol. cdf[16] == kProbScale > slot caps it at 15.
+// Replaces a data-dependent while loop whose mispredicts dominate on
+// high-entropy nibbles.
+ALWAYS_INLINE size_t LookupCdf(const uint16_t* cdf, uint32_t slot) {
+#ifdef F2_SSE2
+  const __m128i sv = _mm_set1_epi16(static_cast<short>(slot + 1));
+  const __m128i m0 = _mm_cmpgt_epi16(
+      sv, _mm_loadu_si128(reinterpret_cast<const __m128i*>(cdf + 1)));
+  const __m128i m1 = _mm_cmpgt_epi16(
+      sv, _mm_loadu_si128(reinterpret_cast<const __m128i*>(cdf + 9)));
+  const unsigned mask =
+      static_cast<unsigned>(_mm_movemask_epi8(_mm_packs_epi16(m0, m1)));
+#ifdef _MSC_VER
+  return static_cast<size_t>(__popcnt(mask));
+#else
+  return static_cast<size_t>(__builtin_popcount(mask));
+#endif
+#else
+  size_t sym = 0;
+  while (cdf[sym + 1] <= slot) ++sym;
+  return sym;
+#endif
+}
 
 #ifdef F2_TRACE
 #include <cstdio>
@@ -139,20 +176,40 @@ public:
   ALWAYS_INLINE uint32_t Freq(size_t sym) const { return cdf_[sym + 1] - cdf_[sym]; }
 
   ALWAYS_INLINE size_t Lookup(uint32_t slot) const {
-    size_t sym = 0;
-    while (cdf_[sym + 1] <= slot) ++sym;
-    return sym;
+    return LookupCdf(cdf_, slot);
   }
 
   ALWAYS_INLINE void Update(size_t sym) {
     const int rate = count_ < 16 ? 3 : (count_ < 64 ? 4 : 5);
     count_ += count_ < 64;
+#ifdef F2_SSE2
+    // Lanes 1..16 uniformly: for i > sym the target i + (kProbScale-16)
+    // equals the scalar kProbScale - (16-i); lane 16 computes target
+    // kProbScale and a zero step, so cdf_[16] stays pinned and there is no
+    // tail. _mm_sra_epi16 is the same arithmetic shift the scalar >> does.
+    const __m128i bump = _mm_set1_epi16(static_cast<short>(kProbScale - 16));
+    const __m128i sv = _mm_set1_epi16(static_cast<short>(sym));
+    const __m128i cnt = _mm_cvtsi32_si128(rate);
+    const __m128i i0 = _mm_setr_epi16(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m128i i1 = _mm_setr_epi16(9, 10, 11, 12, 13, 14, 15, 16);
+    __m128i c0 = _mm_loadu_si128(reinterpret_cast<__m128i*>(cdf_ + 1));
+    __m128i c1 = _mm_loadu_si128(reinterpret_cast<__m128i*>(cdf_ + 9));
+    const __m128i t0 =
+        _mm_add_epi16(i0, _mm_and_si128(_mm_cmpgt_epi16(i0, sv), bump));
+    const __m128i t1 =
+        _mm_add_epi16(i1, _mm_and_si128(_mm_cmpgt_epi16(i1, sv), bump));
+    c0 = _mm_add_epi16(c0, _mm_sra_epi16(_mm_sub_epi16(t0, c0), cnt));
+    c1 = _mm_add_epi16(c1, _mm_sra_epi16(_mm_sub_epi16(t1, c1), cnt));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(cdf_ + 1), c0);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(cdf_ + 9), c1);
+#else
     for (int i = 1; i < 16; ++i) {
       const int target = i <= static_cast<int>(sym)
         ? i
         : static_cast<int>(kProbScale) - (16 - i);
       cdf_[i] = static_cast<uint16_t>(cdf_[i] + ((target - static_cast<int>(cdf_[i])) >> rate));
     }
+#endif
   }
 };
 
@@ -170,12 +227,36 @@ static const int kBlendMaxW = 248;
 
 ALWAYS_INLINE void BlendCdf(const uint16_t* a, const uint16_t* b, uint32_t w,
                             uint16_t* out) {
+#ifdef F2_SSE2
+  // a + ((b-a)*w >> 8) == (a*(256-w) + b*w) >> 8 exactly: a*256 is a multiple
+  // of 256, so the floor of the sum splits at a. madd computes the pair
+  // product in i32 lanes with no overflow (products <= kProbScale*256 = 2^20).
+  // Lane 16 blends to kProbScale on its own since a[16] == b[16] == kProbScale.
+  const __m128i wv =
+      _mm_set1_epi32(static_cast<int>((w << 16) | (256u - w)));
+  const __m128i va0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + 1));
+  const __m128i vb0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 1));
+  const __m128i va1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + 9));
+  const __m128i vb1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 9));
+  const __m128i p00 = _mm_madd_epi16(_mm_unpacklo_epi16(va0, vb0), wv);
+  const __m128i p01 = _mm_madd_epi16(_mm_unpackhi_epi16(va0, vb0), wv);
+  const __m128i p10 = _mm_madd_epi16(_mm_unpacklo_epi16(va1, vb1), wv);
+  const __m128i p11 = _mm_madd_epi16(_mm_unpackhi_epi16(va1, vb1), wv);
+  _mm_storeu_si128(
+      reinterpret_cast<__m128i*>(out + 1),
+      _mm_packs_epi32(_mm_srli_epi32(p00, 8), _mm_srli_epi32(p01, 8)));
+  _mm_storeu_si128(
+      reinterpret_cast<__m128i*>(out + 9),
+      _mm_packs_epi32(_mm_srli_epi32(p10, 8), _mm_srli_epi32(p11, 8)));
+  out[0] = 0;
+#else
   out[0] = 0;
   out[16] = static_cast<uint16_t>(kProbScale);
   for (int i = 1; i < 16; ++i) {
     const int32_t ai = a[i];
     out[i] = static_cast<uint16_t>(ai + (((b[i] - ai) * static_cast<int32_t>(w)) >> 8));
   }
+#endif
 }
 
 // Weight adapts toward "how often the high-order model assigns the observed
@@ -286,8 +367,7 @@ public:
     uint16_t cdf[17];
     BlendCdf(a.cdf_, b.cdf_, *w, cdf);
     const uint32_t slot = x_ & (kProbScale - 1);
-    size_t sym = 0;
-    while (cdf[sym + 1] <= slot) ++sym;
+    const size_t sym = LookupCdf(cdf, slot);
     x_ = (cdf[sym + 1] - cdf[sym]) * (x_ >> kProbBits) + slot - cdf[sym];
     while (x_ < kRansL) x_ = (x_ << 8) | Get();
     UpdateBlendWeight(w, a.Freq(sym), b.Freq(sym));
@@ -440,7 +520,11 @@ ALWAYS_INLINE uint32_t DistBase(uint32_t slot) {
 class Bt4MatchFinder {
 public:
   static const uint32_t kHashBits = 18;
+#ifdef F2_BT_DEPTH
+  static const uint32_t kDepth = F2_BT_DEPTH;
+#else
   static const uint32_t kDepth = 64;
+#endif
   static const uint32_t kSkipDepth = 16;  // reduced budget inside long matches
   static const size_t kNiceLen = 128;     // long enough: splice and stop
   static const size_t kMaxPairs = 64;
