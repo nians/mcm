@@ -430,51 +430,87 @@ ALWAYS_INLINE uint32_t DistBase(uint32_t slot) {
 }
 
 // ---------------------------------------------------------------------------
-// Hash-chain match finder over one chunk.
-class ChainMatchFinder {
+// Binary-tree (bt4) match finder over one chunk. Each hash-4 bucket holds a
+// binary search tree of positions ordered by suffix. One walk does both jobs:
+// it collects the (len, dist) pareto set -- lengths strictly increasing, each
+// with the nearest distance achieving it, so the DP can price every sub-length
+// with its own distance -- and re-roots the tree at the current position.
+// Work per position is bounded by the depth budget and the nice-length splice,
+// which removes the hash chain's pathological cost on repetitive data.
+class Bt4MatchFinder {
 public:
   static const uint32_t kHashBits = 18;
-  static const uint32_t kMaxChain = 96;
-  static const size_t kNiceLen = 128;  // long enough, stop searching
+  static const uint32_t kDepth = 64;
+  static const uint32_t kSkipDepth = 16;  // reduced budget inside long matches
+  static const size_t kNiceLen = 128;     // long enough: splice and stop
+  static const size_t kMaxPairs = 64;
+
+  struct Pair { uint32_t len, dist; };
 
   void Reset(const uint8_t* data, size_t n) {
     data_ = data;
     n_ = n;
     head_.assign(size_t(1) << kHashBits, kNil);
-    chain_.resize(n);
+    // son_ needs no clearing: every slot reachable from a head_ entry was
+    // written during this chunk's walks (both cut styles terminate the tree).
+    son_.resize(2 * n);
   }
 
+  ALWAYS_INLINE size_t GetMatches(size_t pos, size_t max_len, Pair* pairs) {
+    return Walk(pos, max_len, pairs, kDepth);
+  }
   ALWAYS_INLINE void Insert(size_t pos) {
-    if (pos + 4 > n_) return;
-    const uint32_t h = Hash(pos);
-    chain_[pos] = head_[h];
-    head_[h] = static_cast<uint32_t>(pos);
-  }
-
-  ALWAYS_INLINE size_t Find(size_t pos, size_t max_len, size_t* out_dist) const {
-    if (pos + 4 > n_ || max_len < kMinMatch) return 0;
-    size_t best_len = 0, best_dist = 0;
-    uint32_t cand = head_[Hash(pos)];
-    uint32_t depth = kMaxChain;
-    const uint8_t* cur = data_ + pos;
-    while (cand != kNil && depth-- != 0) {
-      const uint8_t* c = data_ + cand;
-      if (c[best_len] == cur[best_len]) {
-        size_t len = 0;
-        while (len < max_len && c[len] == cur[len]) ++len;
-        if (len > best_len) {
-          best_len = len;
-          best_dist = pos - cand;
-          if (len >= max_len || len >= kNiceLen) break;
-        }
-      }
-      cand = chain_[cand];
-    }
-    *out_dist = best_dist;
-    return best_len >= kMinMatch ? best_len : 0;
+    Walk(pos, kNiceLen, nullptr, kSkipDepth);
   }
 
 private:
+  // LZMA-style bt insertion. pairs == nullptr means insert-only.
+  size_t Walk(size_t pos, size_t max_len, Pair* pairs, uint32_t depth) {
+    if (pos + 4 > n_) return 0;
+    const size_t cap = std::min(max_len, n_ - pos);
+    const size_t nice = std::min(cap, kNiceLen);
+    const uint32_t h = Hash(pos);
+    uint32_t cur = head_[h];
+    head_[h] = static_cast<uint32_t>(pos);
+    uint32_t* ptr0 = &son_[2 * pos + 1];
+    uint32_t* ptr1 = &son_[2 * pos];
+    size_t len0 = 0, len1 = 0;
+    size_t npairs = 0, best = kMinMatch - 1;
+    const uint8_t* a = data_ + pos;
+    while (cur != kNil && depth-- != 0) {
+      const uint8_t* b = data_ + cur;
+      size_t len = std::min(len0, len1);
+      while (len < cap && a[len] == b[len]) ++len;
+      if (pairs != nullptr && len > best && npairs < kMaxPairs) {
+        best = len;
+        pairs[npairs].len = static_cast<uint32_t>(len);
+        pairs[npairs].dist = static_cast<uint32_t>(pos - cur);
+        ++npairs;
+      }
+      if (len >= nice) {
+        // Long enough (or window-capped): adopt cur's subtrees and stop.
+        *ptr1 = son_[2 * cur];
+        *ptr0 = son_[2 * cur + 1];
+        return npairs;
+      }
+      uint32_t* pair_slot = &son_[2 * cur];
+      if (b[len] < a[len]) {
+        *ptr1 = cur;
+        ptr1 = pair_slot + 1;
+        cur = *ptr1;
+        len1 = len;
+      } else {
+        *ptr0 = cur;
+        ptr0 = pair_slot;
+        cur = *ptr0;
+        len0 = len;
+      }
+    }
+    *ptr0 = kNil;
+    *ptr1 = kNil;
+    return npairs;
+  }
+
   ALWAYS_INLINE uint32_t Hash(size_t pos) const {
     uint32_t v;
     memcpy(&v, data_ + pos, 4);
@@ -485,7 +521,7 @@ private:
   const uint8_t* data_ = nullptr;
   size_t n_ = 0;
   std::vector<uint32_t> head_;
-  std::vector<uint32_t> chain_;
+  std::vector<uint32_t> son_;
 };
 
 // ---------------------------------------------------------------------------
@@ -682,24 +718,35 @@ public:
             }
           }
         }
-        // Explicit match: one (longest, nearest) candidate, all sub-lengths.
+        // Explicit matches: the bt4 (len, dist) pareto set, so every
+        // sub-length is priced with its own nearest distance and its own
+        // distance context (the old single-candidate form priced all
+        // sub-lengths with the longest match's distance).
         {
-          size_t dist = 0;
-          const size_t mlen = mf_.Find(abs, cand_cap, &dist);
-          mf_.Insert(abs);
-          if (mlen >= kFastLen) {
-            if (!has_break || mlen > brk_len) {
+          Bt4MatchFinder::Pair pairs[Bt4MatchFinder::kMaxPairs];
+          const size_t np = mf_.GetMatches(abs, cand_cap, pairs);
+          if (np != 0 && pairs[np - 1].len >= kFastLen) {
+            if (!has_break || pairs[np - 1].len > brk_len) {
               has_break = true;
               brk_kind = kTokMatch;
-              brk_len = mlen;
-              brk_dist = dist;
+              brk_len = pairs[np - 1].len;
+              brk_dist = pairs[np - 1].dist;
               scan_end = i;
             }
-          } else if (mlen != 0) {
-            const uint32_t dist_price = DistCost(models, mlen, dist);
-            for (size_t l = kMinMatch; l <= mlen; ++l) {
-              relax(i + l, base_cost + tok_price[av][kTokMatch] + kSpeedBias * 5 +
-                    LenCost(models, 0, l, kMinMatch) + dist_price, kTokMatch, l, dist);
+          } else {
+            size_t lo = kMinMatch;
+            const uint32_t mtok = tok_price[av][kTokMatch] + kSpeedBias * 5;
+            for (size_t k = 0; k < np; ++k) {
+              const size_t plen = pairs[k].len;
+              const size_t pdist = pairs[k].dist;
+              if (plen < lo) continue;
+              const uint32_t dp_short = DistCost(models, 0, pdist);
+              const uint32_t dp_long = plen >= 8 ? DistCost(models, 1, pdist) : 0;
+              for (size_t l = lo; l <= plen; ++l) {
+                relax(i + l, base_cost + mtok + LenCost(models, 0, l, kMinMatch) +
+                      (l >= 8 ? dp_long : dp_short), kTokMatch, l, pdist);
+              }
+              lo = plen + 1;
             }
           }
         }
@@ -863,9 +910,8 @@ private:
     return CostNib(m, kLenBypass16) + 16 * 16;
   }
 
-  ALWAYS_INLINE static uint32_t DistCost(const Models& models, size_t len, size_t dist) {
+  ALWAYS_INLINE static uint32_t DistCost(const Models& models, size_t dctx, size_t dist) {
     const uint32_t slot = DistSlot(static_cast<uint32_t>(dist));
-    const size_t dctx = len >= 8 ? 1 : 0;
     const uint32_t ebits = DistExtraBits(slot);
     uint32_t cost = CostNib(models.dist_hi[dctx], slot >> 4) +
       CostNib(models.dist_lo[dctx][std::min<uint32_t>(slot >> 4, 3)], slot & 15);
@@ -971,7 +1017,7 @@ private:
     }
   }
 
-  ChainMatchFinder mf_;
+  Bt4MatchFinder mf_;
   SegmentEncoder enc_;
   LzpTable lzp_;
   std::vector<Models> models_backup_;
