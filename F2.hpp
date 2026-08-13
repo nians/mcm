@@ -399,9 +399,11 @@ struct BinLitModels {
   BitModel o2[1u << kBinHashBits];
   BitModel o3[1u << kBinHashBits];
   BitModel o4[1u << kBinHashBits];
+  BitModel o6[1u << kBinHashBits];
+  BitModel word[1u << kBinHashBits];
   BitModel pred[257 * 256];                // [predicted byte | 256=none][node]
   BitModel o0[256];                        // [node]
-  int32_t w[256 * 16][6];                  // mixer weights per (node, o1 class)
+  int32_t w[256 * 16][8];                  // mixer weights per (node, o1 class)
   uint16_t apm[256][33];                   // SSE transfer per node, 32 buckets
 
   void Init() {
@@ -411,19 +413,20 @@ struct BinLitModels {
     std::fill(o2, o2 + (1u << kBinHashBits), init);
     std::fill(o3, o3 + (1u << kBinHashBits), init);
     std::fill(o4, o4 + (1u << kBinHashBits), init);
+    std::fill(o6, o6 + (1u << kBinHashBits), init);
+    std::fill(word, word + (1u << kBinHashBits), init);
     std::fill(pred, pred + 257 * 256, init);
     std::fill(o0, o0 + 256, init);
     for (int n = 0; n < 256 * 16; ++n) {
-      for (int k = 0; k < 6; ++k) w[n][k] = 1 << 14;
+      for (int k = 0; k < 8; ++k) w[n][k] = 1 << 14;
     }
     // Identity transfer: bucket centers map to their own squashed value.
-    for (int n = 0; n < 256; ++n) {
-      for (int b = 0; b <= 32; ++b) {
-        int st = b * 128 - 2048;
-        if (st < -kStClamp) st = -kStClamp;
-        if (st > kStClamp) st = kStClamp;
-        apm[n][b] = SquashTab()[st + kStClamp + 1];
-      }
+    for (int b = 0; b <= 32; ++b) {
+      int st = b * 128 - 2048;
+      if (st < -kStClamp) st = -kStClamp;
+      if (st > kStClamp) st = kStClamp;
+      const uint16_t v = SquashTab()[st + kStClamp + 1];
+      for (int n = 0; n < 256; ++n) apm[n][b] = v;
     }
   }
 
@@ -438,24 +441,54 @@ struct BinLitModels {
     return ((p1 | (p2 << 8) | (p3 << 16) | (p4 << 24)) * 2654435761u) >>
            (32 - kBinHashBits);
   }
+  ALWAYS_INLINE static uint32_t Hash6(uint32_t p1, uint32_t p2, uint32_t p3,
+                                      uint32_t p4, uint32_t p5, uint32_t p6) {
+    const uint32_t lo = p1 | (p2 << 8) | (p3 << 16) | (p4 << 24);
+    const uint32_t hi = p5 | (p6 << 8);
+    return ((lo * 2654435761u) ^ (hi * 0x9E3779B1u)) >> (32 - kBinHashBits);
+  }
   ALWAYS_INLINE static uint32_t Fold(uint32_t h, uint32_t node) {
     return (h ^ (node * 0x1000193u)) & ((1u << kBinHashBits) - 1);
   }
 };
 
+ALWAYS_INLINE bool IsWordChar(uint32_t c) {
+  const uint32_t l = c | 32u;
+  return (l >= 'a' && l <= 'z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+// Case-folded hash of the alphanumeric run ending just before pos, bounded at
+// 24 bytes. A pure function of the shared history window -- recomputed at
+// every literal on both sides, so there is no incremental state to keep in
+// lockstep and no chunk-seam special case (the scan clamps at the chunk
+// start identically on both sides).
+ALWAYS_INLINE uint32_t WordHashAt(const uint8_t* buf, size_t pos) {
+  size_t n = 0;
+  while (n < 24 && pos - n > 0 && IsWordChar(buf[pos - n - 1])) ++n;
+  uint32_t h = 0;
+  for (size_t j = pos - n; j < pos; ++j) h = h * 0x8B3B15u + (buf[j] | 32u);
+  return h;
+}
+
 // Per-literal context handles; hashes are computed once per literal and only
 // folded with the tree node per bit.
 struct BinLitCtx {
-  uint32_t o1_base, h2, h3, h4, pred_base, wsel;
+  uint32_t o1_base, h2, h3, h4, h6, hw, pred_base, wsel;
   ALWAYS_INLINE static BinLitCtx Make(uint32_t p1, uint32_t p2, uint32_t p3,
-                                      uint32_t p4, uint32_t pred_byte_or_256) {
+                                      uint32_t p4, uint32_t p5, uint32_t p6,
+                                      uint32_t whash, uint32_t pred_byte_or_256) {
     BinLitCtx c;
     c.o1_base = p1 << 8;
     c.h2 = BinLitModels::Hash2(p1, p2);
     c.h3 = BinLitModels::Hash3(p1, p2, p3);
     c.h4 = BinLitModels::Hash4(p1, p2, p3, p4);
+    c.h6 = BinLitModels::Hash6(p1, p2, p3, p4, p5, p6);
+    c.hw = whash;
     c.pred_base = pred_byte_or_256 << 8;
-    c.wsel = (p1 >> 4) & 15;
+    // Mixer weight-set selector: prediction availability is the strongest
+    // regime signal the mixer can specialize on, worth more than one extra
+    // bit of the previous byte.
+    c.wsel = ((pred_byte_or_256 != 256u ? 1u : 0u) << 3) | ((p1 >> 5) & 7);
     return c;
   }
 };
@@ -464,8 +497,8 @@ struct BinLitCtx {
 // SSE stage on top. The final probability averages the mixer with the learned
 // transfer (3:1 toward the transfer, the classic weighting).
 struct BinLitProbe {
-  BitModel* m[6];
-  int32_t st[6];
+  BitModel* m[8];
+  int32_t st[8];
   int32_t* w;
   uint16_t* apm_slot;
   uint32_t p_mix;
@@ -480,10 +513,12 @@ ALWAYS_INLINE uint32_t BinLitMix(BinLitModels& B, const BinLitCtx& ctx,
   pr.m[2] = &B.o2[BinLitModels::Fold(ctx.h2, node)];
   pr.m[3] = &B.o3[BinLitModels::Fold(ctx.h3, node)];
   pr.m[4] = &B.o4[BinLitModels::Fold(ctx.h4, node)];
-  pr.m[5] = &B.pred[ctx.pred_base | node];
+  pr.m[5] = &B.o6[BinLitModels::Fold(ctx.h6, node)];
+  pr.m[6] = &B.word[BinLitModels::Fold(ctx.hw, node)];
+  pr.m[7] = &B.pred[ctx.pred_base | node];
   int64_t dot = 0;
   pr.w = B.w[(node << 4) | ctx.wsel];
-  for (int k = 0; k < 6; ++k) {
+  for (int k = 0; k < 8; ++k) {
     pr.st[k] = stab[pr.m[k]->p];
     dot += static_cast<int64_t>(pr.w[k]) * pr.st[k];
   }
@@ -491,15 +526,17 @@ ALWAYS_INLINE uint32_t BinLitMix(BinLitModels& B, const BinLitCtx& ctx,
   if (sm < -kStClamp) sm = -kStClamp;
   if (sm > kStClamp) sm = kStClamp;
   pr.p_mix = SquashTab()[sm + kStClamp + 1];
-  // SSE: piecewise-linear learned transfer over the stretch domain.
+  // SSE: piecewise-linear learned transfer over the stretch domain, folded
+  // 1:3 toward the mixer -- correction where the models are noisy, neutrality
+  // where the mixer is already sharp. (A chained second stage keyed by the
+  // mixer's own context measured +/-0.1%: same-key corrective stages are
+  // redundant with the weights they sit on.)
   const uint32_t u = static_cast<uint32_t>(sm + 2048);
   const uint32_t b = u >> 7;
   const uint32_t frac = u & 127;
   uint16_t* t = B.apm[node];
   pr.apm_slot = &t[frac >= 64 ? b + 1 : b];
   const uint32_t p_sse = t[b] + (((t[b + 1] - t[b]) * static_cast<int32_t>(frac)) >> 7);
-  // 1:3 toward the mixer: SSE corrects miscalibration where the models are
-  // noisy (binary data) and stays neutral where the mixer is already sharp.
   uint32_t p = (p_sse + 3 * pr.p_mix) >> 2;
   if (p < 1) p = 1;
   if (p > 4095) p = 4095;
@@ -509,7 +546,7 @@ ALWAYS_INLINE uint32_t BinLitMix(BinLitModels& B, const BinLitCtx& ctx,
 
 ALWAYS_INLINE void BinLitLearn(BinLitProbe& pr, int bit) {
   const int32_t err = (bit ? 4095 : 0) - static_cast<int32_t>(pr.p_mix);
-  for (int k = 0; k < 6; ++k) {
+  for (int k = 0; k < 8; ++k) {
     int32_t nw = pr.w[k] + ((pr.st[k] * err) >> kBinMixLR);
     if (nw < -kBinWCap) nw = -kBinWCap;
     if (nw > kBinWCap) nw = kBinWCap;
@@ -1146,7 +1183,14 @@ public:
             // Post-match continuation is approximated as absent while pricing
             // (matching the tier-0/1 convention above).
             const uint32_t pb = pred_[i] != kNoPred ? pred_[i] : 256u;
-            lc += BinLitCost(models, BinLitCtx::Make(p1, p2, p3, p4, pb), c0);
+            // Bytes 5-6 back fall to 0 inside the first bytes of a chunk;
+            // emission and decode use the identical rule, so the seam stays
+            // lockstep (affects at most 6 literals per 16MB chunk).
+            const uint32_t p5 = abs >= 5 ? in[abs - 5] : 0;
+            const uint32_t p6 = abs >= 6 ? in[abs - 6] : 0;
+            lc += BinLitCost(models,
+                             BinLitCtx::Make(p1, p2, p3, p4, p5, p6,
+                                             WordHashAt(in, abs), pb), c0);
           } else {
             const size_t primary = pred_[i] != kNoPred ? 256u + pred_[i] : (p1 & 0xFF);
             const size_t o3h = Models::O3Hash(p1, p2, p3);
@@ -1368,8 +1412,11 @@ private:
 #endif
     if (kLitTier == 2) {
       const uint32_t pb = primary >= 256u ? static_cast<uint32_t>(primary - 256u) : 256u;
+      const uint32_t p5 = pos >= 5 ? in[pos - 5] : 0;
+      const uint32_t p6 = pos >= 6 ? in[pos - 6] : 0;
       BinLitEncode(enc_, models,
-                   BinLitCtx::Make(prev1, prev2, prev3, prev4, pb), c);
+                   BinLitCtx::Make(prev1, prev2, prev3, prev4, p5, p6,
+                                   WordHashAt(in, pos), pb), c);
     } else {
       enc_.PutNibBlended3(models.lit_hi[Models::LitHiCtx(primary, prev2)],
                           models.blend_hi[o3h], &models.bw_hi[o3h],
@@ -1633,8 +1680,12 @@ public:
           if (lit_tier == 2) {
             const uint32_t pb =
               primary >= 256u ? static_cast<uint32_t>(primary - 256u) : 256u;
+            const uint32_t p5 = pos >= 5 ? out[pos - 5] : 0;
+            const uint32_t p6 = pos >= 6 ? out[pos - 6] : 0;
             c = static_cast<uint8_t>(BinLitDecode(
-              dec_, models, BinLitCtx::Make(prev1, prev2, prev3, prev4, pb)));
+              dec_, models,
+              BinLitCtx::Make(prev1, prev2, prev3, prev4, p5, p6,
+                              WordHashAt(out, pos), pb)));
           } else {
             const size_t hi = dec_.GetNibBlended3(
               models.lit_hi[Models::LitHiCtx(primary, prev2)],
