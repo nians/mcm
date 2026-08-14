@@ -374,8 +374,40 @@ inline const uint16_t* SquashTab() {
   return t.data();
 }
 
-// One binary counter: 12-bit probability of bit==1 plus a saturation stage.
-struct BitModel {
+// Bit-history state machine counter: one byte per context slot encoding
+// bounded (n0, n1) counts with opponent halving on each observation -- the
+// nonstationarity trick shift counters cannot express (fresh contrary
+// evidence discounts the accumulated majority instead of nudging it). The
+// 16x16 grid gives exactly 256 states; probabilities live in a per-table
+// StateMap (256 entries, L1-resident, shared across all context slots), so
+// the big hashed tables shrink from 4 to 1 byte per slot -- a quarter of the
+// DRAM traffic of the previous BitModel layout.
+inline const uint8_t* StateNext() {
+  static std::vector<uint8_t> t;
+  if (t.empty()) {
+    t.resize(512);
+    for (int n0 = 0; n0 < 16; ++n0) {
+      for (int n1 = 0; n1 < 16; ++n1) {
+        const int s = n0 * 16 + n1;
+        // bit 0 observed: n0 grows, n1 discounts once past 2.
+        int a0 = n0 < 15 ? n0 + 1 : 15;
+        int b0 = n1 <= 2 ? n1 : n1 / 2 + 1;
+        t[2 * s + 0] = static_cast<uint8_t>(a0 * 16 + b0);
+        // bit 1 observed: mirror.
+        int a1 = n0 <= 2 ? n0 : n0 / 2 + 1;
+        int b1 = n1 < 15 ? n1 + 1 : 15;
+        t[2 * s + 1] = static_cast<uint8_t>(a1 * 16 + b1);
+      }
+    }
+  }
+  return t.data();
+}
+
+// Dense low-order tables (o0/o1/pred, at most a few hundred KB) keep a
+// direct per-slot adaptive probability: their slots are individually hot and
+// the per-slot resolution is worth more than state compression. Only the
+// sparse hashed tables ride the state machine + shared StateMap.
+struct DirectBit {
   uint16_t p = 2048;
   uint16_t cnt = 0;
   ALWAYS_INLINE void Update(int bit) {
@@ -383,6 +415,30 @@ struct BitModel {
     cnt += cnt < 256;
     const int target = bit ? 4095 : 1;
     p = static_cast<uint16_t>(p + ((target - static_cast<int>(p)) >> rate));
+  }
+};
+
+// Adaptive probability per state, shared across every slot of one model
+// table. Seeded from the state's implied Krichevsky-Trofimov estimate and
+// refined online with a visit-staged rate.
+struct StateMap {
+  uint16_t p[256];
+  uint16_t cnt[256];
+  void Init() {
+    for (int n0 = 0; n0 < 16; ++n0) {
+      for (int n1 = 0; n1 < 16; ++n1) {
+        const int v = 4096 * (2 * n1 + 1) / (2 * (n0 + n1) + 2);
+        p[n0 * 16 + n1] = static_cast<uint16_t>(v < 1 ? 1 : (v > 4095 ? 4095 : v));
+        cnt[n0 * 16 + n1] = 0;
+      }
+    }
+  }
+  ALWAYS_INLINE uint32_t P(uint8_t s) const { return p[s]; }
+  ALWAYS_INLINE void Update(uint8_t s, int bit) {
+    const int rate = cnt[s] < 64 ? 4 : (cnt[s] < 1024 ? 5 : 6);
+    cnt[s] += cnt[s] < 1024;
+    const int target = bit ? 4095 : 1;
+    p[s] = static_cast<uint16_t>(p[s] + ((target - static_cast<int>(p[s])) >> rate));
   }
 };
 
@@ -395,28 +451,29 @@ static const size_t kBinMixLR = 11;              // mixer learning-rate shift
 static const int32_t kBinWCap = 1 << 20;
 
 struct BinLitModels {
-  BitModel o1[256 * 256];                  // [prev1][node]
-  BitModel o2[1u << kBinHashBits];
-  BitModel o3[1u << kBinHashBits];
-  BitModel o4[1u << kBinHashBits];
-  BitModel o6[1u << kBinHashBits];
-  BitModel word[1u << kBinHashBits];
-  BitModel pred[257 * 256];                // [predicted byte | 256=none][node]
-  BitModel o0[256];                        // [node]
+  DirectBit o1[256 * 256];                 // [prev1][node]
+  uint8_t o2[1u << kBinHashBits];
+  uint8_t o3[1u << kBinHashBits];
+  uint8_t o4[1u << kBinHashBits];
+  uint8_t o6[1u << kBinHashBits];
+  uint8_t word[1u << kBinHashBits];
+  DirectBit pred[257 * 256];               // [predicted byte | 256=none][node]
+  DirectBit o0[256];                       // [node]
+  StateMap sm[5];                          // one probability map per hashed model
   int32_t w[256 * 16][8];                  // mixer weights per (node, o1 class)
   uint16_t apm[256][33];                   // SSE transfer per node, 32 buckets
 
   void Init() {
-    // Aggregate init: BitModel default state as a pattern fill.
-    const BitModel init;
-    std::fill(o1, o1 + 256 * 256, init);
-    std::fill(o2, o2 + (1u << kBinHashBits), init);
-    std::fill(o3, o3 + (1u << kBinHashBits), init);
-    std::fill(o4, o4 + (1u << kBinHashBits), init);
-    std::fill(o6, o6 + (1u << kBinHashBits), init);
-    std::fill(word, word + (1u << kBinHashBits), init);
-    std::fill(pred, pred + 257 * 256, init);
-    std::fill(o0, o0 + 256, init);
+    const DirectBit dinit;
+    std::fill(o1, o1 + 256 * 256, dinit);
+    memset(o2, 0, sizeof(o2));
+    memset(o3, 0, sizeof(o3));
+    memset(o4, 0, sizeof(o4));
+    memset(o6, 0, sizeof(o6));
+    memset(word, 0, sizeof(word));
+    std::fill(pred, pred + 257 * 256, dinit);
+    std::fill(o0, o0 + 256, dinit);
+    for (int k = 0; k < 5; ++k) sm[k].Init();
     for (int n = 0; n < 256 * 16; ++n) {
       for (int k = 0; k < 8; ++k) w[n][k] = 1 << 14;
     }
@@ -493,11 +550,12 @@ struct BinLitCtx {
   }
 };
 
-// One probe: models, stretched inputs, mixer row, mixed probability, and the
-// SSE stage on top. The final probability averages the mixer with the learned
-// transfer (3:1 toward the transfer, the classic weighting).
+// One probe: state slots, stretched inputs, mixer row, mixed probability, and
+// the SSE stage on top. The final probability averages the mixer with the
+// learned transfer (1:3 toward the mixer).
 struct BinLitProbe {
-  BitModel* m[8];
+  DirectBit* d[3];   // o0, o1, pred
+  uint8_t* m[5];     // hashed: o2, o3, o4, o6, word
   int32_t st[8];
   int32_t* w;
   uint16_t* apm_slot;
@@ -508,19 +566,23 @@ struct BinLitProbe {
 ALWAYS_INLINE uint32_t BinLitMix(BinLitModels& B, const BinLitCtx& ctx,
                                  uint32_t node, BinLitProbe& pr) {
   const int16_t* stab = StretchTab();
-  pr.m[0] = &B.o0[node];
-  pr.m[1] = &B.o1[ctx.o1_base | node];
-  pr.m[2] = &B.o2[BinLitModels::Fold(ctx.h2, node)];
-  pr.m[3] = &B.o3[BinLitModels::Fold(ctx.h3, node)];
-  pr.m[4] = &B.o4[BinLitModels::Fold(ctx.h4, node)];
-  pr.m[5] = &B.o6[BinLitModels::Fold(ctx.h6, node)];
-  pr.m[6] = &B.word[BinLitModels::Fold(ctx.hw, node)];
-  pr.m[7] = &B.pred[ctx.pred_base | node];
+  pr.d[0] = &B.o0[node];
+  pr.d[1] = &B.o1[ctx.o1_base | node];
+  pr.d[2] = &B.pred[ctx.pred_base | node];
+  pr.m[0] = &B.o2[BinLitModels::Fold(ctx.h2, node)];
+  pr.m[1] = &B.o3[BinLitModels::Fold(ctx.h3, node)];
+  pr.m[2] = &B.o4[BinLitModels::Fold(ctx.h4, node)];
+  pr.m[3] = &B.o6[BinLitModels::Fold(ctx.h6, node)];
+  pr.m[4] = &B.word[BinLitModels::Fold(ctx.hw, node)];
   int64_t dot = 0;
   pr.w = B.w[(node << 4) | ctx.wsel];
-  for (int k = 0; k < 8; ++k) {
-    pr.st[k] = stab[pr.m[k]->p];
+  for (int k = 0; k < 3; ++k) {
+    pr.st[k] = stab[pr.d[k]->p];
     dot += static_cast<int64_t>(pr.w[k]) * pr.st[k];
+  }
+  for (int k = 0; k < 5; ++k) {
+    pr.st[3 + k] = stab[B.sm[k].P(*pr.m[k])];
+    dot += static_cast<int64_t>(pr.w[3 + k]) * pr.st[3 + k];
   }
   int32_t sm = static_cast<int32_t>(dot >> 16);
   if (sm < -kStClamp) sm = -kStClamp;
@@ -544,14 +606,19 @@ ALWAYS_INLINE uint32_t BinLitMix(BinLitModels& B, const BinLitCtx& ctx,
   return p;
 }
 
-ALWAYS_INLINE void BinLitLearn(BinLitProbe& pr, int bit) {
+ALWAYS_INLINE void BinLitLearn(BinLitModels& B, BinLitProbe& pr, int bit) {
+  const uint8_t* nx = StateNext();
   const int32_t err = (bit ? 4095 : 0) - static_cast<int32_t>(pr.p_mix);
   for (int k = 0; k < 8; ++k) {
     int32_t nw = pr.w[k] + ((pr.st[k] * err) >> kBinMixLR);
     if (nw < -kBinWCap) nw = -kBinWCap;
     if (nw > kBinWCap) nw = kBinWCap;
     pr.w[k] = nw;
-    pr.m[k]->Update(bit);
+  }
+  for (int k = 0; k < 3; ++k) pr.d[k]->Update(bit);
+  for (int k = 0; k < 5; ++k) {
+    B.sm[k].Update(*pr.m[k], bit);
+    *pr.m[k] = nx[2u * *pr.m[k] + static_cast<unsigned>(bit)];
   }
   const int32_t target = bit ? 4095 : 1;
   *pr.apm_slot = static_cast<uint16_t>(
@@ -906,7 +973,7 @@ ALWAYS_INLINE void BinLitEncode(SegmentEncoder& enc, Models& models,
     const uint32_t p1 = BinLitMix(models.bin, ctx, node, pr);
     const int bit = (c >> i) & 1;
     enc.PutBitP(p1, bit);
-    BinLitLearn(pr, bit);
+    BinLitLearn(models.bin, pr, bit);
     node = (node << 1) | bit;
   }
 }
@@ -918,7 +985,7 @@ ALWAYS_INLINE uint32_t BinLitDecode(SegmentDecoder& dec, Models& models,
     BinLitProbe pr;
     const uint32_t p1 = BinLitMix(models.bin, ctx, node, pr);
     const int bit = dec.GetBitP(p1);
-    BinLitLearn(pr, bit);
+    BinLitLearn(models.bin, pr, bit);
     node = (node << 1) | bit;
   }
   return node & 0xFF;
