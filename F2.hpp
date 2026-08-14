@@ -442,7 +442,11 @@ struct StateMap {
   }
 };
 
-static const size_t kBinHashBits = 21;   // o2/o4 bit-model table size
+#ifdef F2_BIN_HASH_BITS
+static const size_t kBinHashBits = F2_BIN_HASH_BITS;
+#else
+static const size_t kBinHashBits = 23;   // hashed state-table size
+#endif
 #ifdef F2_MIX_LR
 static const size_t kBinMixLR = F2_MIX_LR;
 #else
@@ -457,7 +461,7 @@ struct BinLitModels {
   uint8_t o4[1u << kBinHashBits];
   uint8_t o6[1u << kBinHashBits];
   uint8_t word[1u << kBinHashBits];
-  DirectBit pred[257 * 256];               // [predicted byte | 256=none][node]
+  DirectBit pred[8 * 257 * 256];           // [conf][predicted byte | 256=none][node]
   DirectBit o0[256];                       // [node]
   StateMap sm[5];                          // one probability map per hashed model
   int32_t w[256 * 16][8];                  // mixer weights per (node, o1 class)
@@ -471,7 +475,7 @@ struct BinLitModels {
     memset(o4, 0, sizeof(o4));
     memset(o6, 0, sizeof(o6));
     memset(word, 0, sizeof(word));
-    std::fill(pred, pred + 257 * 256, dinit);
+    std::fill(pred, pred + 8 * 257 * 256, dinit);
     std::fill(o0, o0 + 256, dinit);
     for (int k = 0; k < 5; ++k) sm[k].Init();
     for (int n = 0; n < 256 * 16; ++n) {
@@ -527,13 +531,33 @@ ALWAYS_INLINE uint32_t WordHashAt(const uint8_t* buf, size_t pos) {
   return h;
 }
 
+// Verified backward extent of an LZP candidate, capped at 15 bytes
+// (so the >>1 confidence class stays within its 8-way table): how many
+// bytes before pos also match before cand. A longer verified context makes
+// the candidate's next byte a much stronger prediction -- this is the match
+// model's length-confidence, computed as a pure function of shared history.
+ALWAYS_INLINE uint32_t LzpBackmatch(const uint8_t* buf, size_t pos, size_t cand) {
+  uint32_t n = 0;
+  const size_t lim = cand < 15 ? cand : 15;
+  while (n < lim && n < pos && buf[pos - 1 - n] == buf[cand - 1 - n]) ++n;
+  return n;
+}
+
+// LZP candidates verify 4 context bytes by construction, so the backward
+// extent is always >= 4 and the confidence classes span 2..7. Class 0 is the
+// no-candidate row.
+ALWAYS_INLINE uint32_t ConfClass(uint32_t bm) {
+  return bm >> 1;
+}
+
 // Per-literal context handles; hashes are computed once per literal and only
 // folded with the tree node per bit.
 struct BinLitCtx {
   uint32_t o1_base, h2, h3, h4, h6, hw, pred_base, wsel;
   ALWAYS_INLINE static BinLitCtx Make(uint32_t p1, uint32_t p2, uint32_t p3,
                                       uint32_t p4, uint32_t p5, uint32_t p6,
-                                      uint32_t whash, uint32_t pred_byte_or_256) {
+                                      uint32_t whash, uint32_t pred_byte_or_256,
+                                      uint32_t pred_conf) {
     BinLitCtx c;
     c.o1_base = p1 << 8;
     c.h2 = BinLitModels::Hash2(p1, p2);
@@ -541,7 +565,7 @@ struct BinLitCtx {
     c.h4 = BinLitModels::Hash4(p1, p2, p3, p4);
     c.h6 = BinLitModels::Hash6(p1, p2, p3, p4, p5, p6);
     c.hw = whash;
-    c.pred_base = pred_byte_or_256 << 8;
+    c.pred_base = (pred_conf * 257u + pred_byte_or_256) << 8;
     // Mixer weight-set selector: prediction availability is the strongest
     // regime signal the mixer can specialize on, worth more than one extra
     // bit of the previous byte.
@@ -1203,6 +1227,7 @@ public:
       for (size_t j = 0; j <= dp_cap; ++j) dp[j].cost = 0xFFFFFFFFu;
       dp[0].cost = 0;
       pred_.assign(span, kNoPred);
+      pred_pos_.assign(span, kLzpNil);
       pred_base_ = pos;
       // Two price rows from the span-entry models: availability varies per
       // position (selected by pred_[i] in the scan), prev kinds are frozen at
@@ -1236,6 +1261,7 @@ public:
         // what the decoder will recompute.
         const uint32_t lzp_cand = lzp_.Candidate(in, abs);
         pred_[i] = lzp_cand != kLzpNil ? in[lzp_cand] : kNoPred;
+        pred_pos_[i] = lzp_cand;
         const uint32_t av = lzp_cand != kLzpNil ? 1 : 0;
         // Literal edge (exact bytes; the post-match fallback context is
         // approximated as absent while pricing).
@@ -1250,6 +1276,8 @@ public:
             // Post-match continuation is approximated as absent while pricing
             // (matching the tier-0/1 convention above).
             const uint32_t pb = pred_[i] != kNoPred ? pred_[i] : 256u;
+            const uint32_t pconf = pred_pos_[i] != kLzpNil
+              ? ConfClass(LzpBackmatch(in, abs, pred_pos_[i])) : 0;
             // Bytes 5-6 back fall to 0 inside the first bytes of a chunk;
             // emission and decode use the identical rule, so the seam stays
             // lockstep (affects at most 6 literals per 16MB chunk).
@@ -1257,7 +1285,7 @@ public:
             const uint32_t p6 = abs >= 6 ? in[abs - 6] : 0;
             lc += BinLitCost(models,
                              BinLitCtx::Make(p1, p2, p3, p4, p5, p6,
-                                             WordHashAt(in, abs), pb), c0);
+                                             WordHashAt(in, abs), pb, pconf), c0);
           } else {
             const size_t primary = pred_[i] != kNoPred ? 256u + pred_[i] : (p1 & 0xFF);
             const size_t o3h = Models::O3Hash(p1, p2, p3);
@@ -1450,6 +1478,13 @@ private:
   // have no entry, so catch the insert pointer up and query live -- at that
   // moment the table state is exactly the decoder's (inserts [0, pos)). Using
   // kNoPred there instead desynchronizes the contexts and corrupts the stream.
+  ALWAYS_INLINE uint32_t PredCandAt(const uint8_t* in, size_t pos) {
+    const size_t rel = pos - pred_base_;
+    if (rel < pred_pos_.size()) return pred_pos_[rel];
+    for (; lzp_ptr_ < pos; ++lzp_ptr_) lzp_.Insert(in, lzp_ptr_);
+    return lzp_.Candidate(in, pos);
+  }
+
   ALWAYS_INLINE uint32_t PredAt(const uint8_t* in, size_t pos) {
     const size_t rel = pos - pred_base_;
     if (rel < pred_.size()) return pred_[rel];
@@ -1461,7 +1496,7 @@ private:
   ALWAYS_INLINE void EmitLit(Models& models, const uint8_t* in, size_t& pos,
                              const size_t* reps, uint32_t& prev1, uint32_t& prev2,
                              uint32_t& prev3, uint32_t& prev4, bool& post_match,
-                             uint32_t pred) {
+                             uint32_t pred, uint32_t pred_cand) {
     const uint32_t c = in[pos];
     const uint32_t hi = c >> 4;
     size_t primary;
@@ -1481,9 +1516,14 @@ private:
       const uint32_t pb = primary >= 256u ? static_cast<uint32_t>(primary - 256u) : 256u;
       const uint32_t p5 = pos >= 5 ? in[pos - 5] : 0;
       const uint32_t p6 = pos >= 6 ? in[pos - 6] : 0;
+      // Confidence: verified backward extent of whichever source predicted
+      // (LZP candidate, else the rep0 continuation right after a match).
+      const uint32_t cand = pred_cand;
+      const uint32_t pconf = (pb != 256u && cand != kLzpNil)
+        ? ConfClass(LzpBackmatch(in, pos, cand)) : 0;
       BinLitEncode(enc_, models,
                    BinLitCtx::Make(prev1, prev2, prev3, prev4, p5, p6,
-                                   WordHashAt(in, pos), pb), c);
+                                   WordHashAt(in, pos), pb, pconf), c);
     } else {
       enc_.PutNibBlended3(models.lit_hi[Models::LitHiCtx(primary, prev2)],
                           models.blend_hi[o3h], &models.bw_hi[o3h],
@@ -1590,11 +1630,13 @@ private:
                   std::vector<std::pair<size_t, size_t>>& seg_meta,
                   std::vector<uint8_t>& data) {
     (void)n;
-    const uint32_t pred0 = PredAt(in, pos);
+    const uint32_t cand0 = PredCandAt(in, pos);
+    const uint32_t pred0 = cand0 != kLzpNil ? in[cand0] : kNoPred;
     const bool avail0 = pred0 != kNoPred;
     if (kind == kTokLit) {
       EmitTok(models, prev_kind, prev_kind2, kTokLit, avail0);
-      EmitLit(models, in, pos, reps, prev1, prev2, prev3, prev4, post_match, pred0);
+      EmitLit(models, in, pos, reps, prev1, prev2, prev3, prev4, post_match,
+              pred0, cand0);
     } else {
       if (kind >= kTokRep0 && kind <= kTokRep2) {
         size_t r_found = kNumReps;
@@ -1607,9 +1649,11 @@ private:
           kind = kTokMatch;
         } else {
           for (size_t k = 0; k < len; ++k) {
-            const uint32_t p = k == 0 ? pred0 : PredAt(in, pos);
+            const uint32_t pc = k == 0 ? cand0 : PredCandAt(in, pos);
+            const uint32_t p = pc != kLzpNil ? in[pc] : kNoPred;
             EmitTok(models, prev_kind, prev_kind2, kTokLit, p != kNoPred);
-            EmitLit(models, in, pos, reps, prev1, prev2, prev3, prev4, post_match, p);
+            EmitLit(models, in, pos, reps, prev1, prev2, prev3, prev4, post_match,
+                    p, pc);
             ++seg_tokens;
             if (seg_tokens == kSegTokens) FlushSegment(models, seg_meta, data, seg_tokens);
           }
@@ -1677,6 +1721,7 @@ private:
   LzpTable lzp_;
   std::vector<Models> models_backup_;
   std::vector<uint16_t> pred_;
+  std::vector<uint32_t> pred_pos_;
   size_t pred_base_ = 0;
   size_t lzp_ptr_ = 0;
 };
@@ -1749,10 +1794,13 @@ public:
               primary >= 256u ? static_cast<uint32_t>(primary - 256u) : 256u;
             const uint32_t p5 = pos >= 5 ? out[pos - 5] : 0;
             const uint32_t p6 = pos >= 6 ? out[pos - 6] : 0;
+            const uint32_t cand = lzp_cand;
+            const uint32_t pconf = (pb != 256u && cand != kLzpNil)
+              ? ConfClass(LzpBackmatch(out, pos, cand)) : 0;
             c = static_cast<uint8_t>(BinLitDecode(
               dec_, models,
               BinLitCtx::Make(prev1, prev2, prev3, prev4, p5, p6,
-                              WordHashAt(out, pos), pb)));
+                              WordHashAt(out, pos), pb, pconf)));
           } else {
             const size_t hi = dec_.GetNibBlended3(
               models.lit_hi[Models::LitHiCtx(primary, prev2)],
