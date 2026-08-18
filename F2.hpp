@@ -450,10 +450,16 @@ static const size_t kBinHashBits = 23;   // hashed state-table size
 // Ablation mask: bit k drops predictor lane k entirely (no probe, no
 // update, neutral stretch 0 into the mixer, weight frozen by zero error
 // contribution). Lanes: 0=o0 1=o1 2=pred 3=o2 4=o3 5=o4 6=o6 7=word.
+// Tier 3 (the lean balanced preset) pins mask 80 = drop {o3, o6}: the
+// leave-one-out audit priced every hashed lane, and those two buy the most
+// decode for the least rate at speed-leaning parses. The mask is part of the
+// stream contract -- the chunk's tier byte carries it to the decoder -- so an
+// explicit F2_DROP_MASK override is a same-binary research knob only.
+static const uint32_t kLeanMask = 80;
 #ifdef F2_DROP_MASK
 static const uint32_t kDropMask = F2_DROP_MASK;
 #else
-static const uint32_t kDropMask = 0;
+static const uint32_t kDropMask = kLitTier == 3 ? kLeanMask : 0;
 #endif
 
 #ifdef F2_MIX_LR
@@ -563,6 +569,7 @@ ALWAYS_INLINE uint32_t ConfClass(uint32_t bm) {
 // folded with the tree node per bit.
 struct BinLitCtx {
   uint32_t o1_base, h2, h3, h4, h6, hw, pred_base, wsel;
+  uint32_t drop = kDropMask;
   ALWAYS_INLINE static BinLitCtx Make(uint32_t p1, uint32_t p2, uint32_t p3,
                                       uint32_t p4, uint32_t p5, uint32_t p6,
                                       uint32_t whash, uint32_t pred_byte_or_256,
@@ -587,6 +594,7 @@ struct BinLitCtx {
 // the SSE stage on top. The final probability averages the mixer with the
 // learned transfer (1:3 toward the mixer).
 struct BinLitProbe {
+  uint32_t drop;
   DirectBit* d[3];   // o0, o1, pred
   uint8_t* m[5];     // hashed: o2, o3, o4, o6, word
   int32_t st[8];
@@ -599,23 +607,25 @@ struct BinLitProbe {
 ALWAYS_INLINE uint32_t BinLitMix(BinLitModels& B, const BinLitCtx& ctx,
                                  uint32_t node, BinLitProbe& pr) {
   const int16_t* stab = StretchTab();
-  pr.d[0] = (kDropMask & 1u) ? nullptr : &B.o0[node];
-  pr.d[1] = (kDropMask & 2u) ? nullptr : &B.o1[ctx.o1_base | node];
-  pr.d[2] = (kDropMask & 4u) ? nullptr : &B.pred[ctx.pred_base | node];
-  pr.m[0] = (kDropMask & 8u) ? nullptr : &B.o2[BinLitModels::Fold(ctx.h2, node)];
-  pr.m[1] = (kDropMask & 16u) ? nullptr : &B.o3[BinLitModels::Fold(ctx.h3, node)];
-  pr.m[2] = (kDropMask & 32u) ? nullptr : &B.o4[BinLitModels::Fold(ctx.h4, node)];
-  pr.m[3] = (kDropMask & 64u) ? nullptr : &B.o6[BinLitModels::Fold(ctx.h6, node)];
-  pr.m[4] = (kDropMask & 128u) ? nullptr : &B.word[BinLitModels::Fold(ctx.hw, node)];
+  const uint32_t drop = ctx.drop;
+  pr.drop = drop;
+  pr.d[0] = (drop & 1u) ? nullptr : &B.o0[node];
+  pr.d[1] = (drop & 2u) ? nullptr : &B.o1[ctx.o1_base | node];
+  pr.d[2] = (drop & 4u) ? nullptr : &B.pred[ctx.pred_base | node];
+  pr.m[0] = (drop & 8u) ? nullptr : &B.o2[BinLitModels::Fold(ctx.h2, node)];
+  pr.m[1] = (drop & 16u) ? nullptr : &B.o3[BinLitModels::Fold(ctx.h3, node)];
+  pr.m[2] = (drop & 32u) ? nullptr : &B.o4[BinLitModels::Fold(ctx.h4, node)];
+  pr.m[3] = (drop & 64u) ? nullptr : &B.o6[BinLitModels::Fold(ctx.h6, node)];
+  pr.m[4] = (drop & 128u) ? nullptr : &B.word[BinLitModels::Fold(ctx.hw, node)];
   int64_t dot = 0;
   pr.w = B.w[(node << 4) | ctx.wsel];
   for (int k = 0; k < 3; ++k) {
-    if (kDropMask & (1u << k)) { pr.st[k] = 0; continue; }
+    if (drop & (1u << k)) { pr.st[k] = 0; continue; }
     pr.st[k] = stab[pr.d[k]->p];
     dot += static_cast<int64_t>(pr.w[k]) * pr.st[k];
   }
   for (int k = 0; k < 5; ++k) {
-    if (kDropMask & (8u << k)) { pr.st[3 + k] = 0; continue; }
+    if (drop & (8u << k)) { pr.st[3 + k] = 0; continue; }
     pr.st[3 + k] = stab[B.sm[k].P(*pr.m[k])];
     dot += static_cast<int64_t>(pr.w[3 + k]) * pr.st[3 + k];
   }
@@ -651,10 +661,10 @@ ALWAYS_INLINE void BinLitLearn(BinLitModels& B, BinLitProbe& pr, int bit) {
     pr.w[k] = nw;
   }
   for (int k = 0; k < 3; ++k) {
-    if (!(kDropMask & (1u << k))) pr.d[k]->Update(bit);
+    if (!(pr.drop & (1u << k))) pr.d[k]->Update(bit);
   }
   for (int k = 0; k < 5; ++k) {
-    if (kDropMask & (8u << k)) continue;
+    if (pr.drop & (8u << k)) continue;
     B.sm[k].Update(*pr.m[k], bit);
     *pr.m[k] = nx[2u * *pr.m[k] + static_cast<unsigned>(bit)];
   }
@@ -1286,7 +1296,7 @@ public:
           const uint32_t p4 = abs >= 4 ? in[abs - 4] : (i == 0 ? prev4 : 0);
           const uint32_t c0 = in[abs];
           uint32_t lc = tok_price[av][kTokLit];
-          if (kLitTier == 2) {
+          if (kLitTier >= 2) {
             // Post-match continuation is approximated as absent while pricing
             // (matching the tier-0/1 convention above).
             const uint32_t pb = pred_[i] != kNoPred ? pred_[i] : 256u;
@@ -1526,7 +1536,7 @@ private:
     fprintf(F2TraceFile(0), "L %zu pri=%zu o3=%zu o4=%zu p1=%u p2=%u p3=%u pm=%d r0=%zu\n",
             pos, primary, o3h, o4h, prev1, prev2, prev3, (int)post_match, reps[0]);
 #endif
-    if (kLitTier == 2) {
+    if (kLitTier >= 2) {
       const uint32_t pb = primary >= 256u ? static_cast<uint32_t>(primary - 256u) : 256u;
       const uint32_t p5 = pos >= 5 ? in[pos - 5] : 0;
       const uint32_t p6 = pos >= 6 ? in[pos - 6] : 0;
@@ -1765,8 +1775,9 @@ public:
     }
     if (p >= in_end) return 0;
     const uint8_t lit_tier = *p++;
-    if (lit_tier > 2) return 0;  // corrupt
+    if (lit_tier > 3) return 0;  // corrupt
     const bool use_o4 = lit_tier == 1;
+    const uint32_t lit_drop = lit_tier == 3 ? kLeanMask : kDropMask;
     const size_t n_segments = ReadLeb(p, in_end);
     lzp_.Reset();
     size_t lzp_ptr = 0;
@@ -1803,7 +1814,7 @@ public:
                   pos, primary, o3h, o4h, prev1, prev2, prev3, (int)post_match, reps[0]);
 #endif
           uint8_t c;
-          if (lit_tier == 2) {
+          if (lit_tier >= 2) {
             const uint32_t pb =
               primary >= 256u ? static_cast<uint32_t>(primary - 256u) : 256u;
             const uint32_t p5 = pos >= 5 ? out[pos - 5] : 0;
@@ -1811,10 +1822,10 @@ public:
             const uint32_t cand = lzp_cand;
             const uint32_t pconf = (pb != 256u && cand != kLzpNil)
               ? ConfClass(LzpBackmatch(out, pos, cand)) : 0;
-            c = static_cast<uint8_t>(BinLitDecode(
-              dec_, models,
-              BinLitCtx::Make(prev1, prev2, prev3, prev4, p5, p6,
-                              WordHashAt(out, pos), pb, pconf)));
+            BinLitCtx blc = BinLitCtx::Make(prev1, prev2, prev3, prev4, p5, p6,
+                                            WordHashAt(out, pos), pb, pconf);
+            blc.drop = lit_drop;
+            c = static_cast<uint8_t>(BinLitDecode(dec_, models, blc));
           } else {
             const size_t hi = dec_.GetNibBlended3(
               models.lit_hi[Models::LitHiCtx(primary, prev2)],
