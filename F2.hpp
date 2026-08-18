@@ -447,6 +447,15 @@ static const size_t kBinHashBits = F2_BIN_HASH_BITS;
 #else
 static const size_t kBinHashBits = 23;   // hashed state-table size
 #endif
+// Ablation mask: bit k drops predictor lane k entirely (no probe, no
+// update, neutral stretch 0 into the mixer, weight frozen by zero error
+// contribution). Lanes: 0=o0 1=o1 2=pred 3=o2 4=o3 5=o4 6=o6 7=word.
+#ifdef F2_DROP_MASK
+static const uint32_t kDropMask = F2_DROP_MASK;
+#else
+static const uint32_t kDropMask = 0;
+#endif
+
 #ifdef F2_MIX_LR
 static const size_t kBinMixLR = F2_MIX_LR;
 #else
@@ -590,21 +599,23 @@ struct BinLitProbe {
 ALWAYS_INLINE uint32_t BinLitMix(BinLitModels& B, const BinLitCtx& ctx,
                                  uint32_t node, BinLitProbe& pr) {
   const int16_t* stab = StretchTab();
-  pr.d[0] = &B.o0[node];
-  pr.d[1] = &B.o1[ctx.o1_base | node];
-  pr.d[2] = &B.pred[ctx.pred_base | node];
-  pr.m[0] = &B.o2[BinLitModels::Fold(ctx.h2, node)];
-  pr.m[1] = &B.o3[BinLitModels::Fold(ctx.h3, node)];
-  pr.m[2] = &B.o4[BinLitModels::Fold(ctx.h4, node)];
-  pr.m[3] = &B.o6[BinLitModels::Fold(ctx.h6, node)];
-  pr.m[4] = &B.word[BinLitModels::Fold(ctx.hw, node)];
+  pr.d[0] = (kDropMask & 1u) ? nullptr : &B.o0[node];
+  pr.d[1] = (kDropMask & 2u) ? nullptr : &B.o1[ctx.o1_base | node];
+  pr.d[2] = (kDropMask & 4u) ? nullptr : &B.pred[ctx.pred_base | node];
+  pr.m[0] = (kDropMask & 8u) ? nullptr : &B.o2[BinLitModels::Fold(ctx.h2, node)];
+  pr.m[1] = (kDropMask & 16u) ? nullptr : &B.o3[BinLitModels::Fold(ctx.h3, node)];
+  pr.m[2] = (kDropMask & 32u) ? nullptr : &B.o4[BinLitModels::Fold(ctx.h4, node)];
+  pr.m[3] = (kDropMask & 64u) ? nullptr : &B.o6[BinLitModels::Fold(ctx.h6, node)];
+  pr.m[4] = (kDropMask & 128u) ? nullptr : &B.word[BinLitModels::Fold(ctx.hw, node)];
   int64_t dot = 0;
   pr.w = B.w[(node << 4) | ctx.wsel];
   for (int k = 0; k < 3; ++k) {
+    if (kDropMask & (1u << k)) { pr.st[k] = 0; continue; }
     pr.st[k] = stab[pr.d[k]->p];
     dot += static_cast<int64_t>(pr.w[k]) * pr.st[k];
   }
   for (int k = 0; k < 5; ++k) {
+    if (kDropMask & (8u << k)) { pr.st[3 + k] = 0; continue; }
     pr.st[3 + k] = stab[B.sm[k].P(*pr.m[k])];
     dot += static_cast<int64_t>(pr.w[3 + k]) * pr.st[3 + k];
   }
@@ -639,8 +650,11 @@ ALWAYS_INLINE void BinLitLearn(BinLitModels& B, BinLitProbe& pr, int bit) {
     if (nw > kBinWCap) nw = kBinWCap;
     pr.w[k] = nw;
   }
-  for (int k = 0; k < 3; ++k) pr.d[k]->Update(bit);
+  for (int k = 0; k < 3; ++k) {
+    if (!(kDropMask & (1u << k))) pr.d[k]->Update(bit);
+  }
   for (int k = 0; k < 5; ++k) {
+    if (kDropMask & (8u << k)) continue;
     B.sm[k].Update(*pr.m[k], bit);
     *pr.m[k] = nx[2u * *pr.m[k] + static_cast<unsigned>(bit)];
   }
